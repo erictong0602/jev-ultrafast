@@ -2,12 +2,14 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from browser_harness.admin import ensure_daemon
-from browser_harness.helpers import cdp
+from browser_harness.helpers import cdp, drain_events
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
@@ -17,20 +19,119 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+# Cap stored evidence so a noisy page cannot grow memory unbounded; counts keep rising.
+ERROR_ITEM_LIMIT = 100
+REQUEST_URL_LIMIT = 1000
+
+
 class Browser:
-    def __init__(self, url):
+    def __init__(self, url, *, foreground=False, keep_open=False, collect_errors=True):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        self.keep_open = keep_open
+        self.target = cdp("Target.createTarget", url="about:blank", background=not foreground)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        self.call("Page.navigate", url=url)
+        # Error evidence: console errors, uncaught exceptions, failed/4xx+ requests. A model
+        # judgment of DONE is not proof; these events are.
+        self.collect_errors = collect_errors
+        self.errors = []
+        self.error_counts = {}
+        self._request_urls = {}
+        if collect_errors:
+            self.call("Runtime.enable")
+            self.call("Log.enable")
+            self.call("Network.enable")
+        username = os.environ.get("JEV_BASIC_AUTH_USERNAME")
+        password = os.environ.get("JEV_BASIC_AUTH_PASSWORD")
+        if (username is None) != (password is None):
+            raise ValueError("JEV_BASIC_AUTH_USERNAME and JEV_BASIC_AUTH_PASSWORD must be set together")
+        self.auth_origin = urlparse(url).netloc if username is not None else None
+        self.auth_username = username
+        self.auth_password = password
+        if self.auth_origin:
+            self.call(
+                "Fetch.enable",
+                handleAuthRequests=True,
+                patterns=[{"urlPattern": f"https://{self.auth_origin}/*", "requestStage": "Response"}],
+            )
+        try:
+            self.call("Page.navigate", url=url)
+        except Exception:
+            # Fetch auth challenges pause navigation until answered. The harness
+            # waits synchronously for Page.navigate, so an authenticated load can
+            # time out here even though its challenge is queued for drain_events.
+            if not self.auth_origin:
+                raise
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
+            self._drain()
             if self.evaluate("document.readyState") == "complete":
                 break
             time.sleep(0.02)
+
+    def _record(self, kind, text, url=""):
+        self.error_counts[kind] = self.error_counts.get(kind, 0) + 1
+        if len(self.errors) < ERROR_ITEM_LIMIT:
+            self.errors.append({"kind": kind, "text": text[:300], "url": url[:300]})
+
+    # One drain point for the session: auth challenges must not be starved by error
+    # collection, so both route through the same pass over the daemon event queue.
+    def _drain(self):
+        if not self.auth_origin and not self.collect_errors:
+            return
+        for event in drain_events():
+            if event.get("session_id") != self.session:
+                continue
+            method = event.get("method")
+            params = event.get("params", {})
+            if method == "Fetch.authRequired":
+                challenge_url = urlparse(params.get("request", {}).get("url", ""))
+                response = "ProvideCredentials" if challenge_url.netloc == self.auth_origin else "CancelAuth"
+                self.call(
+                    "Fetch.continueWithAuth",
+                    requestId=params["requestId"],
+                    authChallengeResponse={
+                        "response": response,
+                        **({"username": self.auth_username, "password": self.auth_password}
+                           if response == "ProvideCredentials" else {}),
+                    },
+                )
+            elif method == "Fetch.requestPaused":
+                try:
+                    self.call("Fetch.continueRequest", requestId=params["requestId"])
+                except RuntimeError as error:
+                    if "Invalid InterceptionId" not in str(error):
+                        raise
+            elif method == "Runtime.exceptionThrown":
+                details = params.get("exceptionDetails", {})
+                self._record("exception", details.get("exception", {}).get("description") or details.get("text", ""))
+            elif method == "Runtime.consoleAPICalled":
+                if params.get("type") == "error":
+                    text = " | ".join(
+                        str(a.get("value") if a.get("value") is not None else a.get("description") or "")
+                        for a in params.get("args", [])
+                    )
+                    self._record("console", text)
+            elif method == "Log.entryAdded":
+                entry = params.get("entry", {})
+                if entry.get("level") == "error":
+                    self._record("console", entry.get("text", ""), entry.get("url", ""))
+            elif method == "Network.requestWillBeSent":
+                if len(self._request_urls) >= REQUEST_URL_LIMIT:
+                    self._request_urls.clear()
+                self._request_urls[params.get("requestId")] = params.get("request", {}).get("url", "")
+            elif method == "Network.loadingFailed":
+                self._record("request_failed", params.get("errorText", ""),
+                             self._request_urls.get(params.get("requestId"), ""))
+            elif method == "Network.responseReceived":
+                response = params.get("response", {})
+                if response.get("status", 0) >= 400:
+                    self._record("http_status", f"HTTP {response.get('status')}", response.get("url", ""))
+
+    def error_summary(self):
+        return {"counts": dict(self.error_counts), "items": list(self.errors)}
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
@@ -42,6 +143,7 @@ class Browser:
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
+        self._drain()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
@@ -107,9 +209,9 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
+        if self.target and not self.keep_open:
             cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        self.target = None
 
 
 def fingerprint(state):

@@ -9,14 +9,23 @@ from .model import action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
 
 
+class BudgetExhausted(ValueError):
+    """The run reached its configured decision or action budget."""
+
+class Stalled(ValueError):
+    """Consecutive decisions executed no action; the run made no progress."""
+
+
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, foreground=False,
+                 keep_open=False, collect_errors=True, max_actions=MAX_STEPS,
+                 max_decisions=MAX_STEPS * 2, max_stall=12, choose_retries=2):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
-        self.browser = Browser(url)
+        self.browser = Browser(url, foreground=foreground, keep_open=keep_open, collect_errors=collect_errors)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
@@ -38,6 +47,11 @@ class Agent:
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
+            max_actions=int(max_actions),
+            max_decisions=int(max_decisions),
+            max_stall=int(max_stall),
+            choose_retries=int(choose_retries),
+            stalled_ticks=0,
         )
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -55,12 +69,21 @@ class Agent:
         if name == "tick":
             try:
                 self.command("predict", {})
-                return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
+                result = self.command("act", {"fingerprint": state["page"]["fingerprint"]})
+                state["stalled_ticks"] = 0
+                return result
             except StalePage:
                 state["decision"] = None
                 state["status"] = "ready"
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                # Repeated decisions that execute nothing burn billed calls without progress.
+                state["stalled_ticks"] = state.get("stalled_ticks", 0) + 1
+                if state["stalled_ticks"] >= state.get("max_stall", 12):
+                    state["status"] = "blocked"
+                    raise Stalled(
+                        f"No executed action for {state['stalled_ticks']} consecutive decisions."
+                    ) from None
                 return self.snapshot()
         elif name == "predict":
             if not state["browser"]:
@@ -72,9 +95,17 @@ class Agent:
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
-            if len(state["decisions"]) >= MAX_STEPS * 2:
-                raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+            if len(state["decisions"]) >= state.get("max_decisions", MAX_STEPS * 2):
+                raise BudgetExhausted("Reached the demo's model-call budget")
+            for attempt in range(state.get("choose_retries", 0) + 1):
+                try:
+                    state["decision"] = choose(state["page"], state["goal"], state["history"])
+                    break
+                except ValueError as error:
+                    # An invalid sample is a transient provider fault; re-asking draws a new one.
+                    if attempt >= state.get("choose_retries", 0) or "Invalid TypeSafe response" not in str(error):
+                        raise
+                    time.sleep(0.5 * (attempt + 1))
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -99,9 +130,9 @@ class Agent:
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
-            if len(state["history"]) >= MAX_STEPS:
+            if len(state["history"]) >= state.get("max_actions", MAX_STEPS):
                 state["status"] = "blocked"
-                raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
+                raise BudgetExhausted(f"Stopped at the {state.get('max_actions', MAX_STEPS)}-action demo budget")
             text, helper = None, None
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):

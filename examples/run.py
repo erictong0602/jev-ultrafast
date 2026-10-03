@@ -3,7 +3,9 @@
 Single run (unchanged default behavior):
   uv run --env-file .env python examples/run.py --url URL --goal 'A narrow goal'
 
-Batch sweep with per-page JSONL records:
+Batch sweep with per-page JSONL records. A --urls line may carry per-page
+expectations, so the same file is the regression suite:
+  https://example.com/pricing expect-text=Start free trial
   uv run --env-file .env --frozen python examples/run.py --urls pages.txt \
       --jsonl results.jsonl --goal 'Exercise this page'
 """
@@ -13,11 +15,12 @@ import json
 
 from jev_ultrafast import Agent
 from jev_ultrafast.agent import BudgetExhausted, Stalled
-from jev_ultrafast.reporting import build_record, check_expectations
+from jev_ultrafast.reporting import build_record, check_expectations, parse_pages_file
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--url")
-parser.add_argument("--urls", help="File with one URL per line; blank lines and # comments are skipped.")
+parser.add_argument("--urls", help="File of page specs: URL [expect-url=S] [expect-text=S]; "
+                                   "' #' comments and blank lines are skipped.")
 parser.add_argument("--goal", action="append", required=True, help="Repeat for an ordered list of goals.")
 parser.add_argument("--json", action="store_true", help="Print the JSON record of every run.")
 parser.add_argument("--jsonl", help="Append one JSON record per run to this file.")
@@ -27,29 +30,30 @@ parser.add_argument("--max-actions", type=int, help="Executed-action budget (def
 parser.add_argument("--max-decisions", type=int, help="Billed-decision budget (default 120).")
 parser.add_argument("--max-stall", type=int, help="Stop after N consecutive decisions that execute nothing.")
 parser.add_argument("--retries", type=int, help="Retries for transient invalid model responses (default 2).")
-parser.add_argument("--expect-url", help="Substring the final URL must contain, else the run fails.")
-parser.add_argument("--expect-text", help="Substring the final page text must contain, else the run fails.")
+parser.add_argument("--expect-url", help="Fallback URL substring; a page spec's own expect-url wins.")
+parser.add_argument("--expect-text", help="Fallback page-text substring; a page spec's own expect-text wins.")
+parser.add_argument("--no-heal", action="store_true",
+                    help="Disable session healing for this sweep (never reload or clear storage).")
 args = parser.parse_args()
 
 if args.urls and args.url:
     parser.error("Use --url or --urls, not both")
 
 
-def url_list():
+def page_specs():
+    """(url, expect_url, expect_text) per target; file specs override the CLI fallbacks."""
     if args.urls:
-        with open(args.urls, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    yield line
+        for url, expect_url, expect_text in parse_pages_file(args.urls):
+            yield url, expect_url or args.expect_url, expect_text or args.expect_text
     elif args.url:
-        yield args.url
+        yield args.url, args.expect_url, args.expect_text
     else:
         parser.error("Supply --url or --urls")
 
 
 def agent_options():
-    names = {"foreground": args.foreground, "keep_open": args.keep_open}
+    names = {"foreground": args.foreground, "keep_open": args.keep_open,
+             "heal_session": not args.no_heal}
     options = {k: v for k, v in names.items() if v}
     for flag, key in (("--max-actions", "max_actions"), ("--max-decisions", "max_decisions"),
                       ("--max-stall", "max_stall"), ("--retries", "choose_retries")):
@@ -59,7 +63,7 @@ def agent_options():
     return options
 
 
-def run_one(url):
+def run_one(url, expect_url, expect_text):
     """One walkthrough. Errors are data: any stop becomes a typed record, never a traceback."""
     detail, status, state, errors = "", "error", None, {"counts": {}, "items": []}
     agent = None
@@ -87,8 +91,8 @@ def run_one(url):
             agent.close()
     page = (state or {}).get("page") or {}
     expectations = None
-    if args.expect_url or args.expect_text:
-        expectations = check_expectations(page, args.expect_url, args.expect_text)
+    if expect_url or expect_text:
+        expectations = check_expectations(page, expect_url, expect_text)
         if not all(expectations.values()):
             failed = ", ".join(k for k, ok in expectations.items() if not ok)
             status, detail = "failed_expectation", f"expectation mismatch: {failed}"
@@ -101,10 +105,20 @@ def run_one(url):
     )
 
 
+def row_ok(record):
+    """A row is verified when its expectations all hold; without expectations, done counts."""
+    expectations = record.get("expectations")
+    if expectations is not None:
+        return all(expectations.values())
+    return record["status"] == "done"
+
+
 out = open(args.jsonl, "a", encoding="utf-8") if args.jsonl else None
+records = []
 try:
-    for target in url_list():
-        record = run_one(target)
+    for target, expect_url, expect_text in page_specs():
+        record = run_one(target, expect_url, expect_text)
+        records.append(record)
         line = json.dumps(record)
         if out:
             out.write(line + "\n")
@@ -116,3 +130,7 @@ try:
 finally:
     if out:
         out.close()
+if args.urls and records:
+    bad = [r["url"] for r in records if not row_ok(r)]
+    verdict = f"{len(records) - len(bad)}/{len(records)} pages verified"
+    print(f"== {verdict}" + (f"; failing: {', '.join(bad)}" if bad else ""))

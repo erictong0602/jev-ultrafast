@@ -1,39 +1,51 @@
-https://staging.resumeforu.com/
-https://staging.resumeforu.com/templates
-https://staging.resumeforu.com/templates/classic
-https://staging.resumeforu.com/templates/elegant
-https://staging.resumeforu.com/templates/minimal
-https://staging.resumeforu.com/templates/modern
-https://staging.resumeforu.com/templates/professional
-https://staging.resumeforu.com/pricing
-https://staging.resumeforu.com/guides
-https://staging.resumeforu.com/guides/choose-right-template
-https://staging.resumeforu.com/guides/explain-employment-gaps
-https://staging.resumeforu.com/guides/first-resume-no-experience
-https://staging.resumeforu.com/guides/one-page-or-two
-https://staging.resumeforu.com/guides/pdf-vs-word-vs-canva
-https://staging.resumeforu.com/guides/reach-the-hiring-manager
-https://staging.resumeforu.com/guides/what-ats-friendly-means
-https://staging.resumeforu.com/guides/write-a-strong-summary
-https://staging.resumeforu.com/faq
-https://staging.resumeforu.com/about
-https://staging.resumeforu.com/methodology
-https://staging.resumeforu.com/resume-examples
-https://staging.resumeforu.com/resume-examples/customer-service-representative
-https://staging.resumeforu.com/resume-examples/sales-associate
-https://staging.resumeforu.com/resume-examples/software-engineer
-https://staging.resumeforu.com/resume-examples/registered-nurse
-https://staging.resumeforu.com/resume-examples/project-manager
-https://staging.resumeforu.com/resume-examples/elementary-teacher
-https://staging.resumeforu.com/ats-resume-checker
-https://staging.resumeforu.com/resources
-https://staging.resumeforu.com/resources/cover-letter
-https://staging.resumeforu.com/login
-https://staging.resumeforu.com/signup
-https://staging.resumeforu.com/forgot-password
-https://staging.resumeforu.com/recover
-https://staging.resumeforu.com/auth/recover
-https://staging.resumeforu.com/builder
-https://staging.resumeforu.com/checkout/success
-https://staging.resumeforu.com/p/not-a-real-handle
-https://staging.resumeforu.com/no-such-page-404-check
+# ResumeForU staging regression suite. One spec per line:
+#   URL [expect-url=SUBSTRING] [expect-text=SUBSTRING]
+# A row fails when a listed substring is missing from the final observed page
+# or the run crashes. 'Observe this page, then stop.' keeps the agent from
+# navigating away, so one decision per page verifies the render. Run with:
+#   uv run --env-file .env --frozen python examples/run.py --urls staging-pages.txt --jsonl staging-sweep.jsonl --goal 'Observe this page, then stop.'
+#
+# Known failures kept on file (they fail loudly until staging is fixed):
+#   /login /signup /forgot-password — navigation never commits; the renderer
+#   wedges (also errored with 0 actions in the 2026-10-02 sweep).
+#   /checkout/success — page loads but Runtime.evaluate hangs (5s+).
+
+https://staging.resumeforu.com/ expect-text=noticed
+https://staging.resumeforu.com/templates expect-url=/templates
+https://staging.resumeforu.com/templates/classic expect-url=/templates/classic
+https://staging.resumeforu.com/templates/elegant expect-url=/templates/elegant
+https://staging.resumeforu.com/templates/minimal expect-url=/templates/minimal
+https://staging.resumeforu.com/templates/modern expect-url=/templates/modern
+https://staging.resumeforu.com/templates/professional expect-url=/templates/professional
+https://staging.resumeforu.com/pricing expect-url=/pricing expect-text=$9.99
+https://staging.resumeforu.com/guides expect-url=/guides
+https://staging.resumeforu.com/guides/choose-right-template expect-url=choose-right-template
+https://staging.resumeforu.com/guides/explain-employment-gaps expect-url=explain-employment-gaps
+https://staging.resumeforu.com/guides/first-resume-no-experience expect-url=first-resume-no-experience
+https://staging.resumeforu.com/guides/one-page-or-two expect-url=one-page-or-two
+https://staging.resumeforu.com/guides/pdf-vs-word-vs-canva expect-url=pdf-vs-word-vs-canva
+https://staging.resumeforu.com/guides/reach-the-hiring-manager expect-url=reach-the-hiring-manager
+https://staging.resumeforu.com/guides/what-ats-friendly-means expect-url=what-ats-friendly-means
+https://staging.resumeforu.com/guides/write-a-strong-summary expect-url=write-a-strong-summary
+https://staging.resumeforu.com/faq expect-url=/faq expect-text=FAQ
+https://staging.resumeforu.com/about expect-url=/about expect-text=Editorial
+https://staging.resumeforu.com/methodology expect-url=/methodology
+https://staging.resumeforu.com/resume-examples expect-url=/resume-examples
+https://staging.resumeforu.com/resume-examples/customer-service-representative expect-url=customer-service-representative
+https://staging.resumeforu.com/resume-examples/sales-associate expect-url=sales-associate
+https://staging.resumeforu.com/resume-examples/software-engineer expect-url=software-engineer
+https://staging.resumeforu.com/resume-examples/registered-nurse expect-url=registered-nurse
+https://staging.resumeforu.com/resume-examples/project-manager expect-url=project-manager
+https://staging.resumeforu.com/resume-examples/elementary-teacher expect-url=elementary-teacher
+https://staging.resumeforu.com/ats-resume-checker expect-url=/ats-resume-checker
+https://staging.resumeforu.com/resources expect-url=/resources expect-text=career
+https://staging.resumeforu.com/resources/cover-letter expect-url=cover-letter
+https://staging.resumeforu.com/login  # known-failing: navigation never commits
+https://staging.resumeforu.com/signup  # known-failing: navigation never commits
+https://staging.resumeforu.com/forgot-password  # known-failing: navigation never commits
+https://staging.resumeforu.com/recover expect-url=/recover
+https://staging.resumeforu.com/auth/recover expect-url=/auth/recover expect-text=guest
+https://staging.resumeforu.com/builder expect-url=/builder
+https://staging.resumeforu.com/checkout/success  # known-failing: evaluate hangs after load
+https://staging.resumeforu.com/p/not-a-real-handle expect-text=broken
+https://staging.resumeforu.com/no-such-page-404-check expect-text=broken

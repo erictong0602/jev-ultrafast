@@ -14,3 +14,4 @@ staging-sweep.jsonl
 stripe-url.txt
 *.der
 docs/motion-docs.db
+recover-link.txt

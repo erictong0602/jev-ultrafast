@@ -91,6 +91,8 @@ uv run --env-file .env python examples/run.py \
 
 `uv run --env-file .env python examples/flights.py --keep-open` performs the flight search, checks the actual route/date/results, and saves its trace. It does not select or book a flight.
 
+Batch sweeps double as a regression suite: `examples/run.py --urls pages.txt` reads one page spec per line, `URL [expect-url=SUBSTRING] [expect-text=SUBSTRING]`, runs every page, and prints a `pages verified` tally. A row passes when each listed substring appears in the final observed page. `'Observe this page, then stop.'` keeps the agent from navigating away, so one decision per page verifies the render. `--no-heal` disables session healing for the sweep.
+
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.

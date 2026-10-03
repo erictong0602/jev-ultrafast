@@ -8,3 +8,9 @@ artifacts/
 *.egg-info/
 
 dist/
+
+# Session experiment artifacts: raw traces and scratch data stay local (AGENTS.md)
+staging-sweep.jsonl
+stripe-url.txt
+*.der
+docs/motion-docs.db

@@ -79,6 +79,31 @@ def summarize_records(records):
     return sorted(rows, key=lambda row: (row["pass_rate"], row["url"]))
 
 
+def steps_from_history(history):
+    """Turn one executed run into an e2e step draft.
+
+    The draft records what the agent actually did — operation, observed target
+    label, generated text, and the URL transition — as a starting point for a
+    maintained e2e suite. It is evidence, not a replayer: replay still needs a
+    person (or another Jev run) to resolve targets against a live page.
+    """
+    steps = []
+    for entry in history:
+        step = {
+            "n": entry.get("step"),
+            "operation": {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT",
+                          "scroll": "SCROLL", "wait": "WAIT"}.get(entry.get("kind"),
+                                                                 str(entry.get("kind", "")).upper()),
+            "target": entry.get("action"),
+            "url_after": entry.get("url"),
+            "page_changed": entry.get("page_changed"),
+        }
+        if entry.get("text") is not None:
+            step["text"] = entry.get("text")
+        steps.append(step)
+    return steps
+
+
 def check_expectations(page, expect_url=None, expect_text=None):
     """Substring checks over the last observed page. Only requested checks appear in the result."""
     page = page or {}

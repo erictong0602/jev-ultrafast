@@ -237,6 +237,29 @@ class Browser:
         self._ensure_network()
         self._maintenance_call("Network.clearBrowserCache")
 
+    def save_cookies(self, url, path):
+        """Write one origin's cookies to a JSON snapshot; returns the count.
+
+        Snapshot files hold live session credentials: keep them under the user
+        home (the default in scripts/session.py), never inside a repository.
+        """
+        cookies = self.cookies(url)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(
+            {"origin": url, "saved_at": int(time.time()), "cookies": cookies},
+            indent=2,
+        ), encoding="utf-8")
+        return len(cookies)
+
+    def restore_cookies(self, path):
+        """Load a cookie snapshot written by save_cookies; returns the count."""
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        cookies = data.get("cookies") or []
+        if cookies:
+            self._ensure_network()
+            self._maintenance_call("Storage.setCookies", cookies=cookies)
+        return len(cookies)
+
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
 
@@ -313,8 +336,13 @@ class Browser:
         return result
 
     def close(self):
+        # A close-time daemon hiccup must not crash the batch run that owns this tab;
+        # the target dies with Chrome regardless.
         if self.target and not self.keep_open:
-            cdp("Target.closeTarget", targetId=self.target)
+            try:
+                cdp("Target.closeTarget", targetId=self.target)
+            except Exception:
+                pass
         self.target = None
 
 

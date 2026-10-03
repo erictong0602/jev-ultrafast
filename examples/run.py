@@ -12,11 +12,20 @@ expectations, so the same file is the regression suite:
 
 import argparse
 import json
+import re
 import time
+from pathlib import Path
 
 from jev_ultrafast import Agent
 from jev_ultrafast.agent import BudgetExhausted, Stalled
-from jev_ultrafast.reporting import build_record, check_expectations, parse_pages_file, record_passed
+from jev_ultrafast.browser import cdp
+from jev_ultrafast.reporting import (
+    build_record,
+    check_expectations,
+    parse_pages_file,
+    record_passed,
+    steps_from_history,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--url")
@@ -25,6 +34,8 @@ parser.add_argument("--urls", help="File of page specs: URL [expect-url=S] [expe
 parser.add_argument("--goal", action="append", required=True, help="Repeat for an ordered list of goals.")
 parser.add_argument("--json", action="store_true", help="Print the JSON record of every run.")
 parser.add_argument("--jsonl", help="Append one JSON record per run to this file.")
+parser.add_argument("--trace", help="Write the last run's executed steps as an e2e draft JSON "
+                                   "(best with a single --url run).")
 parser.add_argument("--foreground", action="store_true", help="Open the working tab in the foreground.")
 parser.add_argument("--keep-open", action="store_true", help="Leave the tab open after the run ends.")
 parser.add_argument("--max-actions", type=int, help="Executed-action budget (default 60).")
@@ -64,6 +75,40 @@ def agent_options():
     return options
 
 
+def failure_evidence(agent, url, status, expectations):
+    """One JPEG of the final page when a run fails; humans read it, the model never does."""
+    if agent is None:
+        return None
+    if status in {"done", "blocked"} and (expectations is None or all(expectations.values())):
+        return None
+    session = None
+    try:
+        import base64
+
+        # After a finished loop the run's own CDP session can stop answering
+        # captureScreenshot (evaluates still work). A fresh attach to the same
+        # tab always captures, so evidence borrows one and lets it go.
+        agent.browser._drain()
+        session = cdp("Target.attachToTarget", targetId=agent.browser.target, flatten=True)["sessionId"]
+        shot = cdp("Page.captureScreenshot", session_id=session, _response_timeout=30,
+                   format="jpeg", quality=72)
+        folder = Path("artifacts/sweep-failures")
+        folder.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9._-]", "_", url.split("://", 1)[-1])[:80]
+        path = folder / f"{int(time.time())}-{slug}.jpg"
+        path.write_bytes(base64.b64decode(shot["data"]))
+        return str(path)
+    except Exception as error:
+        print(f"   (failure screenshot unavailable: {type(error).__name__}: {error})")
+        return None
+    finally:
+        if session:
+            try:
+                cdp("Target.detachFromTarget", sessionId=session)
+            except Exception:
+                pass
+
+
 def run_one(url, expect_url, expect_text):
     """One walkthrough. Errors are data: any stop becomes a typed record, never a traceback."""
     detail, status, state, errors = "", "error", None, {"counts": {}, "items": []}
@@ -90,11 +135,11 @@ def run_one(url, expect_url, expect_text):
         status, detail = "timeout", f"{type(error).__name__}: {error}"
     except Exception as error:  # A crashed run still yields a record; no traceback in batch output.
         detail = f"{type(error).__name__}: {error}"
-    finally:
-        if agent is not None:
-            errors = agent.browser.error_summary()
-            heal_events = list(agent.browser.session_events)
-            agent.close()
+    if agent is not None:
+        # Everything between the try block and here is pure computation, so closing
+        # after evidence capture loses nothing.
+        errors = agent.browser.error_summary()
+        heal_events = list(agent.browser.session_events)
     page = (state or {}).get("page") or {}
     expectations = None
     if expect_url or expect_text:
@@ -110,6 +155,21 @@ def run_one(url, expect_url, expect_text):
         errors=errors, expectations=expectations, heal_events=heal_events,
     )
     record["ts"] = int(time.time())
+    screenshot = failure_evidence(agent, url, status, expectations)
+    if screenshot:
+        record["failure_screenshot"] = screenshot
+    if agent is not None:
+        if args.trace and state is not None:
+            trace = {
+                "url": url,
+                "goal": args.goal[-1],
+                "final_url": page.get("url"),
+                "status": status,
+                "steps": steps_from_history(state.get("history", [])),
+            }
+            Path(args.trace).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.trace).write_text(json.dumps(trace, indent=2), encoding="utf-8")
+        agent.close()
     return record
 
 

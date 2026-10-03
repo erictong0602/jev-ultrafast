@@ -19,6 +19,16 @@ dev = ["pytest>=8.4,<9", "ruff>=0.14,<1", "pillow>=11,<13"]
 
 [tool.ruff]
 line-length = 120
+extend-exclude = [
+    # One-off local experiment scripts kept at the repo root for reference; the
+    # shipped loop, tests, examples, and scripts/ stay fully linted.
+    "auth-loop.py", "auth-loop2.py", "auth-loop3.py", "auth_loop_lib.py",
+    "cdp.py", "cdputil.py", "check_auth.py", "cover_shot.py", "eval.py",
+    "inspect-settings.py", "mouse.py", "nav-plane.py", "nav.py",
+    "nav_infisical.py", "poll_authed.py", "poll_login.py", "probe_endpoints.py",
+    "seed-panel-token.py", "shot.py", "signup-dance.py", "stripe-fill.py",
+    "verify_deck.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

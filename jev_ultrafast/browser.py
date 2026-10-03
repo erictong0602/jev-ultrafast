@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -23,9 +24,13 @@ class StalePage(ValueError):
 ERROR_ITEM_LIMIT = 100
 REQUEST_URL_LIMIT = 1000
 
+# Main-document responses that prove the session is dead. A 200 login page is a soft
+# signal; it only counts when JEV_LOGIN_URL_PATTERN names it.
+AUTH_FAILURE_STATUSES = (401, 403)
+
 
 class Browser:
-    def __init__(self, url, *, foreground=False, keep_open=False, collect_errors=True):
+    def __init__(self, url, *, foreground=False, keep_open=False, collect_errors=True, heal_session=True):
         ensure_daemon()
         self.keep_open = keep_open
         self.target = cdp("Target.createTarget", url="about:blank", background=not foreground)["targetId"]
@@ -36,12 +41,20 @@ class Browser:
         # Error evidence: console errors, uncaught exceptions, failed/4xx+ requests. A model
         # judgment of DONE is not proof; these events are.
         self.collect_errors = collect_errors
+        # The tab shares the attached Chrome profile, so cookies and storage persist across
+        # runs like a normal browser. Healing never touches that profile without evidence.
+        self.heal_session = heal_session
         self.errors = []
         self.error_counts = {}
         self._request_urls = {}
-        if collect_errors:
+        self.document_status = None
+        self.document_url = ""
+        self.session_events = []
+        self._network_enabled = bool(collect_errors or heal_session)
+        if self.collect_errors:
             self.call("Runtime.enable")
             self.call("Log.enable")
+        if self._network_enabled:
             self.call("Network.enable")
         username = os.environ.get("JEV_BASIC_AUTH_USERNAME")
         password = os.environ.get("JEV_BASIC_AUTH_PASSWORD")
@@ -56,6 +69,11 @@ class Browser:
                 handleAuthRequests=True,
                 patterns=[{"urlPattern": f"https://{self.auth_origin}/*", "requestStage": "Response"}],
             )
+        self._load(url)
+        if heal_session:
+            self.heal(url)
+
+    def _load(self, url):
         try:
             self.call("Page.navigate", url=url)
         except Exception:
@@ -127,11 +145,85 @@ class Browser:
                              self._request_urls.get(params.get("requestId"), ""))
             elif method == "Network.responseReceived":
                 response = params.get("response", {})
+                if params.get("type") == "Document":
+                    self.document_status = response.get("status")
+                    self.document_url = response.get("url", "")
                 if response.get("status", 0) >= 400:
                     self._record("http_status", f"HTTP {response.get('status')}", response.get("url", ""))
 
     def error_summary(self):
         return {"counts": dict(self.error_counts), "items": list(self.errors)}
+
+    def session_ok(self, url):
+        """Read-only verdict that the loaded session still works. Hard signals are
+        401/403 on the main document; a 200 login wall only counts when the
+        JEV_LOGIN_URL_PATTERN regex names its URL. No signal means keep cookies."""
+        if self.document_status in AUTH_FAILURE_STATUSES:
+            return False
+        pattern = os.environ.get("JEV_LOGIN_URL_PATTERN", "").strip()
+        if pattern and re.search(pattern, self.document_url or url):
+            return False
+        return True
+
+    def heal(self, url):
+        """Behave like a person with a normal browser: keep cookies, reload once,
+        and only clear this origin's cookies and cache when the session still
+        looks dead. Other sites' logins and the rest of the profile stay intact."""
+        if self.session_ok(url):
+            return
+        self.session_events = ["landing looks logged out"]
+        self._load(url)
+        if self.session_ok(url):
+            self.session_events.append("reload restored the session")
+            return
+        stale = self.cookies(url)
+        self.clear_cookies(url)
+        self.clear_cache()
+        origin = urlparse(self.document_url or url).netloc
+        self.session_events.append(f"cleared {len(stale)} cookie(s) and cache for {origin}")
+        self._load(url)
+        pattern = os.environ.get("JEV_LOGIN_URL_PATTERN", "").strip()
+        if pattern and not self.session_ok(url):
+            self.session_events.append("still behind the login wall; sign in once in the tab")
+        else:
+            self.session_events.append("origin storage cleared; the next sign-in persists")
+
+    def _ensure_network(self):
+        if not self._network_enabled:
+            self.call("Network.enable")
+            self._network_enabled = True
+
+    def _maintenance_call(self, method, **params):
+        # Cache eviction can sweep a full disk cache; the default 5s IPC response
+        # timeout is too tight for those round trips.
+        return cdp(method, session_id=self.session, _response_timeout=30, **params)
+
+    def cookies(self, url=None):
+        """Cookie records for one origin, or every cookie in the profile with url=None."""
+        self._ensure_network()
+        if url is None:
+            return self._maintenance_call("Storage.getCookies").get("cookies", [])
+        parsed = urlparse(url)
+        return self._maintenance_call(
+            "Network.getCookies", urls=[f"{parsed.scheme or 'https'}://{parsed.netloc}", url]
+        ).get("cookies", [])
+
+    def clear_cookies(self, url=None):
+        """Delete cookies for one origin (default) or every origin with url=None."""
+        self._ensure_network()
+        if url is None:
+            self._maintenance_call("Network.clearBrowserCookies")
+            return
+        for cookie in self.cookies(url):
+            params = {"name": cookie["name"], "path": cookie.get("path", "/")}
+            if cookie.get("domain"):
+                params["domain"] = cookie["domain"]
+            self._maintenance_call("Network.deleteCookies", **params)
+
+    def clear_cache(self):
+        """Empty the HTTP cache. Cookies and site storage are untouched."""
+        self._ensure_network()
+        self._maintenance_call("Network.clearBrowserCache")
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)

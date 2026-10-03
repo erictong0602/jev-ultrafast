@@ -100,6 +100,7 @@ uv run --env-file .env python examples/run.py \
 - **Wait for useful state.** After typing into a combobox, wait for visible suggestions, capped at 200 ms. Other interactions get at most two animation frames or 50 ms. These reads happen after execution is logged.
 - **Keep hidden tabs rendering.** Focus emulation prevents background animation throttling without switching Chrome's visible tab.
 - **Send visible text.** Offscreen article bodies and footers do not fill the model context.
+- **Keep the session like a normal browser.** The tab shares the attached Chrome profile, so a sign-in persists across runs. When the landing page auth-fails (HTTP 401/403, or a `JEV_LOGIN_URL_PATTERN` match), the browser reloads once with cookies intact and clears only that origin's cookies and cache if the session still looks dead; every step is recorded as evidence. `scripts/session.py` inspects or resets one origin, and `scripts/automation_chrome.py` runs a dedicated Chrome with a persistent profile.
 - **Reuse an interrupted text request.** A generated value survives a stale-page retry only if the entire text-helper input is unchanged.
 
 Every executed target is resolved from an observed node. The executor rechecks page freshness and click occlusion. Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing.

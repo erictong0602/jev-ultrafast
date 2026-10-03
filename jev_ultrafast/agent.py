@@ -18,14 +18,15 @@ class Stalled(ValueError):
 
 class Agent:
     def __init__(self, url, goals, *, record_dir=None, screenshots=False, foreground=False,
-                 keep_open=False, collect_errors=True, max_actions=MAX_STEPS,
+                 keep_open=False, collect_errors=True, heal_session=True, max_actions=MAX_STEPS,
                  max_decisions=MAX_STEPS * 2, max_stall=12, choose_retries=2):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
-        self.browser = Browser(url, foreground=foreground, keep_open=keep_open, collect_errors=collect_errors)
+        self.browser = Browser(url, foreground=foreground, keep_open=keep_open,
+                               collect_errors=collect_errors, heal_session=heal_session)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:

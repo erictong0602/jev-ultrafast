@@ -12,10 +12,11 @@ expectations, so the same file is the regression suite:
 
 import argparse
 import json
+import time
 
 from jev_ultrafast import Agent
 from jev_ultrafast.agent import BudgetExhausted, Stalled
-from jev_ultrafast.reporting import build_record, check_expectations, parse_pages_file
+from jev_ultrafast.reporting import build_record, check_expectations, parse_pages_file, record_passed
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--url")
@@ -66,6 +67,7 @@ def agent_options():
 def run_one(url, expect_url, expect_text):
     """One walkthrough. Errors are data: any stop becomes a typed record, never a traceback."""
     detail, status, state, errors = "", "error", None, {"counts": {}, "items": []}
+    heal_events = []
     agent = None
     try:
         agent = Agent(url, args.goal, **agent_options())
@@ -83,11 +85,15 @@ def run_one(url, expect_url, expect_text):
             status, detail = "blocked", str(error)
         else:
             detail = f"{type(error).__name__}: {error}"
+    except TimeoutError as error:
+        # A wedged renderer or a dead daemon is its own outcome class in long runs.
+        status, detail = "timeout", f"{type(error).__name__}: {error}"
     except Exception as error:  # A crashed run still yields a record; no traceback in batch output.
         detail = f"{type(error).__name__}: {error}"
     finally:
         if agent is not None:
             errors = agent.browser.error_summary()
+            heal_events = list(agent.browser.session_events)
             agent.close()
     page = (state or {}).get("page") or {}
     expectations = None
@@ -96,21 +102,15 @@ def run_one(url, expect_url, expect_text):
         if not all(expectations.values()):
             failed = ", ".join(k for k, ok in expectations.items() if not ok)
             status, detail = "failed_expectation", f"expectation mismatch: {failed}"
-    return build_record(
+    record = build_record(
         url=url, status=status, detail=detail, page=page,
         actions=len((state or {}).get("history", [])),
         decisions=len((state or {}).get("decisions", [])),
         elapsed_ms=(state or {}).get("elapsed_ms", 0),
-        errors=errors, expectations=expectations,
+        errors=errors, expectations=expectations, heal_events=heal_events,
     )
-
-
-def row_ok(record):
-    """A row is verified when its expectations all hold; without expectations, done counts."""
-    expectations = record.get("expectations")
-    if expectations is not None:
-        return all(expectations.values())
-    return record["status"] == "done"
+    record["ts"] = int(time.time())
+    return record
 
 
 out = open(args.jsonl, "a", encoding="utf-8") if args.jsonl else None
@@ -131,6 +131,6 @@ finally:
     if out:
         out.close()
 if args.urls and records:
-    bad = [r["url"] for r in records if not row_ok(r)]
+    bad = [r["url"] for r in records if not record_passed(r)]
     verdict = f"{len(records) - len(bad)}/{len(records)} pages verified"
     print(f"== {verdict}" + (f"; failing: {', '.join(bad)}" if bad else ""))

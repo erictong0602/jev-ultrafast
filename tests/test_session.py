@@ -24,6 +24,38 @@ def no_login_pattern(monkeypatch):
     monkeypatch.delenv("JEV_LOGIN_URL_PATTERN", raising=False)
 
 
+def test_wedged_page_does_not_leak_its_tab(monkeypatch):
+    methods = []
+    state = {"fail_navigate": True}
+
+    def cdp(method, **params):
+        methods.append(method)
+        if method == "Target.createTarget":
+            return {"targetId": "t1"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "s1"}
+        if method == "Page.navigate" and state["fail_navigate"]:
+            raise RuntimeError("Page.navigate timed out after 5s")
+        if method == "Runtime.evaluate":
+            return {"result": {"value": "complete"}}
+        return {}
+
+    monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
+    monkeypatch.setattr(browser_mod, "cdp", cdp)
+    monkeypatch.delenv("JEV_BASIC_AUTH_USERNAME", raising=False)
+    monkeypatch.delenv("JEV_BASIC_AUTH_PASSWORD", raising=False)
+    with pytest.raises(RuntimeError, match="timed out"):
+        Browser("https://example.test/", collect_errors=False, heal_session=False)
+    assert "Target.closeTarget" in methods  # The tab died with the failed init.
+
+    methods.clear()
+    state["fail_navigate"] = False
+    b = Browser("https://example.test/", collect_errors=False, heal_session=False)
+    assert "Target.closeTarget" not in methods  # A healthy init opens nothing extra.
+    b.close()
+    assert methods.count("Target.closeTarget") == 1
+
+
 @pytest.mark.parametrize("status,alive", [(200, True), (302, True), (500, True), (401, False), (403, False)])
 def test_document_status_alone_decides_the_verdict(status, alive):
     assert browser_with(status).session_ok("https://example.test/") is alive

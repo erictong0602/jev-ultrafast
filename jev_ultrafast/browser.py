@@ -34,6 +34,18 @@ class Browser:
         ensure_daemon()
         self.keep_open = keep_open
         self.target = cdp("Target.createTarget", url="about:blank", background=not foreground)["targetId"]
+        try:
+            self._attach(url, collect_errors, heal_session)
+        except BaseException:
+            # A wedged page must not leak a tab in unattended batch runs.
+            try:
+                cdp("Target.closeTarget", targetId=self.target)
+            except Exception:
+                pass
+            self.target = None
+            raise
+
+    def _attach(self, url, collect_errors, heal_session):
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.

@@ -42,6 +42,43 @@ def parse_pages_file(path):
     return specs
 
 
+def record_passed(record):
+    """A row is verified when its expectations all hold; without expectations, done counts."""
+    expectations = record.get("expectations")
+    if expectations is not None:
+        return all(expectations.values())
+    return record["status"] == "done"
+
+
+def summarize_records(records):
+    """Per-URL stability across appended sweep runs, for long-term trend evidence.
+
+    Returns one row per URL, flakiest first: run count, pass rate, and the most
+    recent outcome with its evidence.
+    """
+    by_url = {}
+    for record in records:
+        entry = by_url.setdefault(record["url"], {"runs": 0, "passed": 0, "last": None})
+        entry["runs"] += 1
+        if record_passed(record):
+            entry["passed"] += 1
+        entry["last"] = record
+    rows = []
+    for url, entry in by_url.items():
+        last = entry["last"]
+        rows.append({
+            "url": url,
+            "runs": entry["runs"],
+            "passed": entry["passed"],
+            "pass_rate": round(entry["passed"] / entry["runs"], 3),
+            "last_status": last["status"],
+            "last_detail": (last.get("detail") or "")[:140],
+            "last_heal_events": len(last.get("heal_events") or []),
+            "last_ts": last.get("ts"),
+        })
+    return sorted(rows, key=lambda row: (row["pass_rate"], row["url"]))
+
+
 def check_expectations(page, expect_url=None, expect_text=None):
     """Substring checks over the last observed page. Only requested checks appear in the result."""
     page = page or {}
@@ -54,7 +91,7 @@ def check_expectations(page, expect_url=None, expect_text=None):
 
 
 def build_record(*, url, status, detail="", page=None, actions=0, decisions=0, elapsed_ms=0,
-                 errors=None, expectations=None):
+                 errors=None, expectations=None, heal_events=None):
     """One JSON-serializable outcome row: the judgment, its evidence, and any expectation results."""
     return {
         "url": url,
@@ -66,4 +103,5 @@ def build_record(*, url, status, detail="", page=None, actions=0, decisions=0, e
         "elapsed_ms": elapsed_ms,
         "errors": errors or {"counts": {}, "items": []},
         "expectations": expectations,
+        "heal_events": heal_events or [],
     }

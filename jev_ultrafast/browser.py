@@ -238,26 +238,52 @@ class Browser:
         self._maintenance_call("Network.clearBrowserCache")
 
     def save_cookies(self, url, path):
-        """Write one origin's cookies to a JSON snapshot; returns the count.
+        """Write one origin's cookies and localStorage to a JSON snapshot; returns the cookie count.
 
         Snapshot files hold live session credentials: keep them under the user
         home (the default in scripts/session.py), never inside a repository.
+        localStorage is captured best-effort — the tab must currently be on the
+        origin, which it is right after a normal load.
         """
         cookies = self.cookies(url)
+        local_storage = None
+        try:
+            origin = urlparse(self.evaluate("location.href") or "").netloc
+            if origin == urlparse(url).netloc:
+                local_storage = self.evaluate(
+                    "(() => { const out={}; for (let i=0;i<localStorage.length;i++) "
+                    "{ const k=localStorage.key(i); out[k]=localStorage.getItem(k); } return out; })()")
+        except (StalePage, RuntimeError, ValueError, AttributeError):
+            local_storage = None
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(
-            {"origin": url, "saved_at": int(time.time()), "cookies": cookies},
+            {"origin": url, "saved_at": int(time.time()), "cookies": cookies,
+             "local_storage": local_storage},
             indent=2,
         ), encoding="utf-8")
         return len(cookies)
 
     def restore_cookies(self, path):
-        """Load a cookie snapshot written by save_cookies; returns the count."""
+        """Load a snapshot written by save_cookies; returns the cookie count.
+
+        localStorage items are replayed only when the tab currently sits on the
+        snapshot's origin, so scripts/session.py loads the URL first.
+        """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         cookies = data.get("cookies") or []
         if cookies:
             self._ensure_network()
             self._maintenance_call("Storage.setCookies", cookies=cookies)
+        items = data.get("local_storage") or {}
+        if items:
+            try:
+                origin = urlparse(self.evaluate("location.href") or "").netloc
+                if origin == urlparse(data.get("origin", "")).netloc:
+                    self.evaluate("(() => { const items = " + json.dumps(items) + ";"
+                                  " for (const [k, v] of Object.entries(items)) localStorage.setItem(k, v);"
+                                  " return Object.keys(items).length; })()")
+            except (StalePage, RuntimeError, ValueError):
+                pass
         return len(cookies)
 
     def call(self, method, **params):
@@ -315,7 +341,7 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
-        if action is not None and action["kind"] in {"click", "select"}:
+        if action is not None and action["kind"] in {"click", "select", "file"}:
             node = action["node"]
             if type(node) is not int:
                 return False
@@ -326,12 +352,13 @@ class Browser:
             return current == [page["page_key"], page["guards"].get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
 
-    def act(self, action, page, text=None):
+    def act(self, action, page, text=None, files=None):
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
-        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
+        result = browser_operation({"operation": "act", "session": self.session, "action": action,
+                                    "text": text, "files": files})
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -374,6 +401,8 @@ def browser_operation(request):
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
+            if kind == "file" and not (request.get("files") or []):
+                raise ValueError("SET_FILE needs operator-provided file paths; none were given.")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
             target = evaluate("""(action => {
               const e=window.__jevFast?.nodes.get(action.node);
@@ -396,7 +425,36 @@ def browser_operation(request):
                 if kind == "select":
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
                 raise StalePage("Target changed or is covered. Observe again.")
-            if kind != "select":
+            if kind == "file":
+                # The chooser is bypassed entirely: the file comes from the operator,
+                # never from model output, and the change event tells the page.
+                files = [str(f) for f in request["files"]]
+                if not files:
+                    raise ValueError("SET_FILE needs operator-provided file paths; none were given.")
+                remote = call(
+                    "Runtime.evaluate",
+                    expression=f"window.__jevFast.nodes.get({action['node']})",
+                    returnByValue=False,
+                    objectGroup="jev-setfile",
+                )
+                object_id = (remote.get("result") or {}).get("objectId")
+                if not object_id:
+                    raise StalePage("File target vanished. Observe again.")
+                call("DOM.enable")
+                # requestNode only resolves once the DOM agent has a document.
+                call("DOM.getDocument", depth=0)
+                node = call("DOM.requestNode", objectId=object_id)["nodeId"]
+                call("DOM.setFileInputFiles", files=files, nodeId=node)
+                call("Runtime.releaseObjectGroup", objectGroup="jev-setfile")
+                set_count = evaluate(
+                    f"(() => {{ const e = window.__jevFast.nodes.get({action['node']});"
+                    " e.dispatchEvent(new Event('input',{bubbles:true}));"
+                    " e.dispatchEvent(new Event('change',{bubbles:true}));"
+                    " return e.files.length; })()"
+                )
+                if set_count != len(files):
+                    raise StalePage("File attachment was not confirmed; inspect before retrying.")
+            elif kind != "select":
                 x, y = target["x"], target["y"]
                 for event in ("mousePressed", "mouseReleased"):
                     call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)

@@ -6,7 +6,7 @@
     const id=cache.ids.get(e); cache.nodes.set(id,e); return id;
   };
   for (const [id,e] of cache.nodes) if (!e.isConnected) cache.nodes.delete(id);
-  const safe = e => !['password','file','hidden'].includes(e.type);
+  const safe = e => !['password','hidden'].includes(e.type);
   const visible = e => !e.closest('[aria-hidden="true"],[inert]') &&
     e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
   const name = (e,seen=new Set()) => {
@@ -34,6 +34,7 @@
     if (e.tagName==='TEXTAREA' || e.isContentEditable) return 'textbox';
     if (e.tagName==='INPUT') {
       if (['checkbox','radio'].includes(e.type)) return e.type;
+      if (e.type==='file') return 'file';
       if (['button','submit','reset','image'].includes(e.type)) return 'button';
       if (e.type==='search') return 'searchbox';
       if (e.type==='number') return 'spinbutton';
@@ -69,6 +70,8 @@
       for (const o of e.options) if (!o.selected && !o.disabled && !o.closest('optgroup[disabled]'))
         actions.push({...base,kind:'select',value:o.value,
           current_value:[...e.selectedOptions].map(o=>o.label).join(', '),label:base.label+' → '+o.label});
+    } else if (rname==='file') {
+      actions.push({...base,kind:'file',value:''});
     } else {
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||

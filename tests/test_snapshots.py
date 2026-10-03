@@ -27,11 +27,23 @@ def test_save_writes_origin_scoped_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(browser_mod, "cdp", cdp)
     path = tmp_path / "snapshots" / "staging.json"
     b = browser_with()
+    b.evaluate = Mock(side_effect=["https://example.test/", {"theme": "dark"}])
     assert b.save_cookies("https://example.test/", path) == 1
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["origin"] == "https://example.test/"
     assert data["cookies"][0]["name"] == "sid"
+    assert data["local_storage"] == {"theme": "dark"}
     assert data["saved_at"] > 0
+
+
+def test_save_survives_a_wrong_origin_tab(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser_mod, "cdp", lambda method, **params: {"cookies": []})
+    b = browser_with()
+    b.evaluate = Mock(return_value="https://other.test/")
+    path = tmp_path / "snap.json"
+    assert b.save_cookies("https://example.test/", path) == 0
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["local_storage"] is None  # Never captures another origin's storage.
 
 
 def test_restore_replays_snapshot_cookies(tmp_path, monkeypatch):
@@ -43,13 +55,28 @@ def test_restore_replays_snapshot_cookies(tmp_path, monkeypatch):
 
     monkeypatch.setattr(browser_mod, "cdp", cdp)
     path = tmp_path / "snap.json"
-    path.write_text(json.dumps({"origin": "https://example.test/", "saved_at": 1, "cookies": [
+    path.write_text(json.dumps({"origin": "https://example.test/", "saved_at": 1,
+                                "local_storage": {"cart": "1"},
+                                "cookies": [
         {"name": "sid", "value": "s3cret", "domain": ".example.test", "path": "/"},
     ]}), encoding="utf-8")
     b = browser_with()
+    b.evaluate = Mock(side_effect=["https://example.test/", 1])
     assert b.restore_cookies(path) == 1
     assert calls[0][0] == "Storage.setCookies"
     assert calls[0][1]["cookies"][0]["name"] == "sid"
+    assert "localStorage.setItem" in b.evaluate.call_args_list[1].args[0]
+
+
+def test_restore_skips_storage_on_a_different_origin(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser_mod, "cdp", lambda method, **params: {})
+    path = tmp_path / "snap.json"
+    path.write_text(json.dumps({"origin": "https://example.test/", "saved_at": 1,
+                                "local_storage": {"cart": "1"}, "cookies": []}), encoding="utf-8")
+    b = browser_with()
+    b.evaluate = Mock(return_value="https://elsewhere.test/")
+    assert b.restore_cookies(path) == 0
+    b.evaluate.assert_called_once()  # The origin check ran; nothing was written.
 
 
 def test_restore_of_an_empty_snapshot_is_a_noop(tmp_path):

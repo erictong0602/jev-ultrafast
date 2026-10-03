@@ -6,9 +6,11 @@
 #   uv run --env-file .env --frozen python examples/run.py --urls staging-pages.txt --jsonl staging-sweep.jsonl --goal 'Observe this page, then stop.'
 #
 # Known failures kept on file (they fail loudly until staging is fixed):
-#   /login /signup /forgot-password — navigation never commits; the renderer
-#   wedges (also errored with 0 actions in the 2026-10-02 sweep).
-#   /checkout/success — page loads but Runtime.evaluate hangs (5s+).
+#   /login /signup /forgot-password — staging serves a Next.js SSR error page
+#   (__next_error__) with or without Referer/Origin headers; navigation never
+#   commits in the browser. Server-side defect, also errored in the
+#   2026-10-02 sweep. /checkout/success — page loads but Runtime.evaluate
+#   hangs (renderer wedge).
 
 https://staging.resumeforu.com/ expect-text=noticed
 https://staging.resumeforu.com/templates expect-url=/templates

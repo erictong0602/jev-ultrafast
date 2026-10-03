@@ -18,13 +18,18 @@ class Stalled(ValueError):
 
 class Agent:
     def __init__(self, url, goals, *, record_dir=None, screenshots=False, foreground=False,
-                 keep_open=False, collect_errors=True, heal_session=True, max_actions=MAX_STEPS,
-                 max_decisions=MAX_STEPS * 2, max_stall=12, choose_retries=2):
+                 keep_open=False, collect_errors=True, heal_session=True, files=None,
+                 max_actions=MAX_STEPS, max_decisions=MAX_STEPS * 2, max_stall=12, choose_retries=2):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
+        # SET_FILE attachments come from the operator; the model never names paths.
+        self.files = [str(Path(f).resolve()) for f in (files or [])]
+        for path in self.files:
+            if not Path(path).is_file():
+                raise ValueError(f"File to upload does not exist: {path}")
         self.browser = Browser(url, foreground=foreground, keep_open=keep_open,
                                collect_errors=collect_errors, heal_session=heal_session)
         self.record_dir = Path(record_dir) if record_dir else None
@@ -48,6 +53,7 @@ class Agent:
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
+            files=self.files,
             max_actions=int(max_actions),
             max_decisions=int(max_decisions),
             max_stall=int(max_stall),
@@ -146,7 +152,8 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            state["browser"].act(action, page, text=text,
+                                 files=state.get("files") if action["kind"] == "file" else None)
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.

@@ -46,6 +46,8 @@ parser.add_argument("--expect-url", help="Fallback URL substring; a page spec's 
 parser.add_argument("--expect-text", help="Fallback page-text substring; a page spec's own expect-text wins.")
 parser.add_argument("--no-heal", action="store_true",
                     help="Disable session healing for this sweep (never reload or clear storage).")
+parser.add_argument("--file", action="append",
+                    help="Local file the agent may attach to a file input (repeatable; enables SET_FILE).")
 args = parser.parse_args()
 
 if args.urls and args.url:
@@ -67,6 +69,8 @@ def agent_options():
     names = {"foreground": args.foreground, "keep_open": args.keep_open,
              "heal_session": not args.no_heal}
     options = {k: v for k, v in names.items() if v}
+    if args.file:
+        options["files"] = args.file
     for flag, key in (("--max-actions", "max_actions"), ("--max-decisions", "max_decisions"),
                       ("--max-stall", "max_stall"), ("--retries", "choose_retries")):
         value = getattr(args, flag.lstrip("-").replace("-", "_"))

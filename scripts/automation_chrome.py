@@ -4,11 +4,16 @@ The profile lives on disk, so a sign-in survives restarts like a normal
 browser, and a dedicated user-data-dir avoids the per-connection
 "Allow remote debugging" popup Chrome 144+ shows on the daily profile.
 
-  uv run python scripts/automation_chrome.py
+One profile per project keeps test accounts and sessions apart:
+
+  uv run python scripts/automation_chrome.py                    # default profile
+  uv run python scripts/automation_chrome.py --profile staging  # ~/.jev-ultrafast/profiles/staging
+  uv run python scripts/automation_chrome.py --list
   export BU_CDP_WS=<the printed ws:// URL>
   uv run jev
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -17,8 +22,43 @@ import time
 import urllib.request
 from pathlib import Path
 
+ROOT = Path(os.environ.get("JEV_HOME") or Path.home() / ".jev-ultrafast")
 PORT = int(os.environ.get("JEV_DEBUG_PORT") or 9333)
-PROFILE = Path(os.environ.get("JEV_PROFILE_DIR") or Path.home() / ".jev-ultrafast" / "chrome-profile")
+PROFILE = Path(os.environ.get("JEV_PROFILE_DIR") or (ROOT / "chrome-profile"))
+
+parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+parser.add_argument("--profile", help="Named profile under ~/.jev-ultrafast/profiles; one Chrome each.")
+parser.add_argument("--list", action="store_true", help="List known profiles and their ports.")
+args = parser.parse_args()
+
+
+def profile_dir():
+    if args.profile:
+        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in args.profile)
+        return ROOT / "profiles" / safe
+    return PROFILE
+
+
+def port_for(directory):
+    """First launch picks the next free port from 9333 up and keeps it for this profile."""
+    marker = directory / "port.txt"
+    if marker.is_file():
+        try:
+            return int(marker.read_text().strip())
+        except ValueError:
+            pass
+    used = set()
+    for other in (ROOT / "profiles").glob("*/port.txt"):
+        try:
+            used.add(int(other.read_text().strip()))
+        except (OSError, ValueError):
+            continue
+    port = PORT
+    while port in used and port < PORT + 200:
+        port += 1
+    directory.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{port}\n", encoding="utf-8")
+    return port
 
 
 def chrome_binary():
@@ -39,44 +79,54 @@ def chrome_binary():
     return next((path for path in candidates if path.is_file()), None)
 
 
-def endpoint_ready():
+def endpoint_ready(port):
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/version", timeout=2).read()
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2).read()
         return True
     except Exception:
         return False
 
 
-def devtools_ws():
+def devtools_ws(directory, port):
     try:
-        lines = (PROFILE / "DevToolsActivePort").read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = (directory / "DevToolsActivePort").read_text(encoding="utf-8", errors="replace").splitlines()
         return f"ws://127.0.0.1:{lines[0].strip()}{lines[1].strip()}"
     except (OSError, IndexError):
         return None
 
 
 def main():
-    ws = devtools_ws()
-    if ws is None and endpoint_ready():
+    if args.list:
+        default = PROFILE
+        print(f"default  {default}  port {PORT}")
+        for folder in sorted((ROOT / "profiles").glob("*/port.txt")):
+            port = folder.read_text().strip()
+            print(f"{folder.parent.name}  {folder.parent}  port {port}")
+        return
+
+    directory = profile_dir()
+    port = port_for(directory) if args.profile else PORT
+    ws = devtools_ws(directory, port)
+    if ws is None and endpoint_ready(port):
         try:
-            body = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/version", timeout=2).read())
+            body = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2).read())
             ws = body.get("webSocketDebuggerUrl")
         except Exception:
             ws = None
     if ws:
-        print(f"Chrome is already serving this profile on port {PORT}.")
+        print(f"Chrome is already serving {directory} on port {port}.")
         print(f"BU_CDP_WS={ws}")
         return
 
     binary = chrome_binary()
     if not binary:
         raise SystemExit("Chrome not found; set JEV_CHROME_PATH to the chrome executable.")
-    PROFILE.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
     subprocess.Popen(
         [
             str(binary),
-            f"--remote-debugging-port={PORT}",
-            f"--user-data-dir={PROFILE}",
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={directory}",
             "--no-first-run",
             "--no-default-browser-check",
         ],
@@ -85,12 +135,12 @@ def main():
     )
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        if ws := devtools_ws():
-            print(f"Dedicated automation Chrome is running with profile {PROFILE}.")
+        if ws := devtools_ws(directory, port):
+            print(f"Dedicated automation Chrome is running with profile {directory} on port {port}.")
             print(f"BU_CDP_WS={ws}")
             return
         time.sleep(0.5)
-    raise SystemExit(f"Chrome did not open its DevTools port within 30s; is port {PORT} free?")
+    raise SystemExit(f"Chrome did not open its DevTools port within 30s; is port {port} free?")
 
 
 if __name__ == "__main__":

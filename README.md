@@ -102,7 +102,7 @@ Batch sweeps double as a regression suite: `examples/run.py --urls pages.txt` re
 - **Wait for useful state.** After typing into a combobox, wait for visible suggestions, capped at 200 ms. Other interactions get at most two animation frames or 50 ms. These reads happen after execution is logged.
 - **Keep hidden tabs rendering.** Focus emulation prevents background animation throttling without switching Chrome's visible tab.
 - **Send visible text.** Offscreen article bodies and footers do not fill the model context.
-- **Keep the session like a normal browser.** The tab shares the attached Chrome profile, so a sign-in persists across runs. When the landing page auth-fails (HTTP 401/403, or a `JEV_LOGIN_URL_PATTERN` match), the browser reloads once with cookies intact and clears only that origin's cookies and cache if the session still looks dead; every step is recorded as evidence. `scripts/session.py` inspects or resets one origin, `save`/`load` snapshot an origin's cookies under `~/.jev-ultrafast/sessions` so a proven login can be restored after experiments, and `scripts/automation_chrome.py` runs a dedicated Chrome with a persistent profile.
+- **Keep the session like a normal browser.** The tab shares the attached Chrome profile, so a sign-in persists across runs. The agent drives the operator's own Chrome with no automation flags, so UA and fingerprints stay genuine. Input stays at the browser's input layer and moves like a hand: the cursor travels a curved path before every click, the wheel flicks in notched ticks with a decaying tail, typing is per character with word-shaped rhythm, and native dropdowns commit through real keyboard events (the value path remains as a fallback). The window size varies per run (`JEV_VIEWPORT=WxH` pins it for recordings), and `JEV_DWELL_MS=min-max` adds an opt-in reading pause between actions. Error evidence comes from passive in-page collectors instead of debugger domains, and the session's node cache hides under a fresh, non-enumerable window key each process. When the landing page auth-fails (HTTP 401/403, or a `JEV_LOGIN_URL_PATTERN` match), the browser reloads once with cookies intact and clears only that origin's cookies and cache if the session still looks dead; every step is recorded as evidence. `scripts/session.py` inspects or resets one origin, `save`/`load` snapshot an origin's cookies under `~/.jev-ultrafast/sessions` so a proven login can be restored after experiments, and `scripts/automation_chrome.py` runs a dedicated Chrome with a persistent profile.
 - **Reuse an interrupted text request.** A generated value survives a stale-page retry only if the entire text-helper input is unchanged.
 
 Every executed target is resolved from an observed node. The executor rechecks page freshness and click occlusion. Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing.
@@ -120,7 +120,7 @@ Every executed target is resolved from an observed node. The executor rechecks p
 
 ## Evidence and limits
 
-The current video is a **7,073 ms** Google Flights run. Timing starts after initial page observation and includes model calls, generated text, browser work, stale decisions, and loading waits. A fresh independent check verifies the one-way setting, Zürich, London, September 20, 2026, and visible flight options. The video plays at 1×, with no opening hold and a 0.5-second final hold.
+The current video is a **7,073 ms** Google Flights run. Timing starts after initial page observation and includes model calls, generated text, browser work, stale decisions, and loading waits. A fresh independent check verifies the one-way setting, Zürich, London, September 20, 2026, and visible flight options. The video plays at 1×, with no opening hold and a 0.5-second final hold. The recording predates the human-pacing work (cursor travel, wheel ticks, keystroke rhythm), which adds roughly 0.1–0.3 s per interaction.
 
 In six alternating runs with identical models and settings, both versions passed **3/3**. Median task time went from **9.450 s → 7.092 s**, a **25% reduction**; median browser protocol calls went from **1,092 → 101**. This is three repeats of one task on one browser profile, not a general reliability benchmark.
 
@@ -138,7 +138,7 @@ node --check jev_ultrafast/snapshot.js
 uv build
 ```
 
-Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls. Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
+Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls, and `uv run python scripts/check_browserlikeness.py` verifies on a live page that the input stays trusted and human-paced. Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
 
 ---
 

@@ -2,8 +2,11 @@
 
 import hashlib
 import json
+import math
 import os
+import random
 import re
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -12,9 +15,167 @@ from urllib.parse import urlparse
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp, drain_events
 
+# Each process hides its snapshot cache under a fresh, non-enumerable window property.
+# getOwnPropertyNames still lists hidden properties, so the key carries no recognizable
+# prefix (chromedriver's cdc_ is caught exactly that way) — full enumeration finds only
+# one anonymous-looking identifier that changes every run.
+FAST_KEY = secrets.choice("abcdefghijk") + secrets.token_hex(8)
+_KEY_JSON = json.dumps(FAST_KEY)
+
+def _js(source):
+    """Embed the per-process cache key into a page-side expression."""
+    return source.replace("__JEV_KEY__", _KEY_JSON)
+
 # Atomically read visible content and controls, preserving actual DOM node identity.
-READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
+READ_STATE = _js(Path(__file__).with_name("snapshot.js").read_text())
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+
+# Passive evidence collector: uncaught exceptions and unhandled rejections reach the
+# window error listeners without Runtime.enable, whose console serialization pages
+# can observe. Set JEV_RUNTIME_ERRORS=1 to restore deep debugger capture for debugging.
+PAGE_ERROR_COLLECTOR = _js("""
+(() => {
+  const key=__JEV_KEY__;
+  if (!window[key]) Object.defineProperty(window,key,
+    {value:{},enumerable:false,configurable:true,writable:true});
+  const store=window[key];
+  if (store.page_errors) return;
+  store.page_errors=[];
+  window.addEventListener('error',e=>{
+    if (store.page_errors.length>=200) return;
+    const err=e.error;
+    store.page_errors.push({kind:'exception',
+      text:(err&&(err.stack||err.message))||e.message||'Error',url:e.filename||''});
+  });
+  window.addEventListener('unhandledrejection',e=>{
+    if (store.page_errors.length>=200) return;
+    const r=e.reason;
+    store.page_errors.push({kind:'exception',text:(r&&(r.stack||r.message))||String(r),url:''});
+  });
+})()
+""")
+
+# Keep typing and clicks inside what a hand on a real keyboard produces.
+TYPE_KEY_LIMIT = 160
+
+# Per-session input state: where the cursor last rested and the emulated viewport.
+# browser_operation receives only a session id, so the registry is the carrier.
+_session_state = {}
+
+def typing_plan(text):
+    """('keys', text) when per-character trusted key events fit, else ('insert', text)."""
+    if (text and os.environ.get("JEV_TYPE_MODE", "").strip().lower() != "insert"
+            and len(text) <= TYPE_KEY_LIMIT and all(0x20 <= ord(char) <= 0x7E for char in text)):
+        return "keys", text
+    return "insert", text
+
+def typing_gaps(text):
+    """Inter-key delays: quick bursts inside a word, a longer pause starting the next one.
+    The bands are disjoint so a page measuring keystroke rhythm sees a word-shaped cadence."""
+    gaps = []
+    for char in text[:-1]:
+        if char == " ":
+            gaps.append(random.uniform(0.035, 0.075))  # onset of a new word
+        elif not (char.isalnum() and char.isascii()):
+            gaps.append(random.uniform(0.018, 0.045))  # punctuation or symbol
+        else:
+            gaps.append(random.uniform(0.004, 0.012))  # inside a word
+    return gaps
+
+def char_key_params(char, press=True):
+    """CDP keyDown (press=True) / keyUp parameters for one printable ASCII character.
+
+    Insertion is driven by the text field on keyDown; a key event without text only
+    presses the key and types nothing."""
+    if char.isalpha() and char.isascii():
+        params = {"key": char, "code": f"Key{char.upper()}",
+                  "windowsVirtualKeyCode": ord(char.upper()),
+                  "modifiers": 8 if char.isupper() else 0}
+    elif char.isdigit():
+        params = {"key": char, "code": f"Digit{char}", "windowsVirtualKeyCode": ord(char)}
+    elif char == " ":
+        params = {"key": " ", "code": "Space", "windowsVirtualKeyCode": 32}
+    else:
+        params = {"key": char}
+    if press:
+        params.update(text=char, unmodifiedText=char.lower())
+    return params
+
+def arrow_params(direction):
+    """CDP parameters for one trusted ArrowDown/ArrowUp press."""
+    return {"key": f"Arrow{direction}", "code": f"Arrow{direction}",
+            "windowsVirtualKeyCode": 40 if direction == "Down" else 38}
+
+def viewport_for_run():
+    """A plausible desktop window size per run; JEV_VIEWPORT=WxH pins one for recordings."""
+    spec = os.environ.get("JEV_VIEWPORT", "").strip().lower()
+    if spec:
+        try:
+            width, height = (int(part) for part in spec.split("x"))
+        except ValueError:
+            raise ValueError("JEV_VIEWPORT must be WxH, e.g. 1280x800") from None
+        if width < 400 or height < 400:
+            raise ValueError("JEV_VIEWPORT must be at least 400x400")
+        return width, height
+    return random.choice(((1120, 780), (1280, 800), (1366, 768), (1440, 860),
+                          (1536, 864), (1680, 947), (1920, 955)))
+
+def scroll_point(session):
+    """A wheel position that varies like a hand on the wheel, inside the live viewport."""
+    width, height = _session_state.get(session, {}).get("viewport") or (1120, 780)
+    return (random.randint(width // 5, width * 4 // 5),
+            random.randint(height // 5, height * 7 // 10))
+
+def wheel_plan(total_delta, rng=random):
+    """A wheel flick: 4-6 notched ticks that land on the target distance and, when the
+    flick is long, sometimes the small ease-back a hand does after overshooting."""
+    sign = 1 if total_delta > 0 else -1
+    remaining = abs(int(total_delta))
+    if remaining <= 0:
+        return []
+    notches = []
+    ticks = rng.randint(4, 6)
+    for index in range(ticks):
+        share = remaining / (ticks - index)
+        size = max(28, min(round(share * rng.uniform(0.75, 1.25)), remaining))
+        notches.append(sign * size)
+        remaining -= size
+    if remaining > 0:
+        notches[-1] += sign * remaining
+    if abs(int(total_delta)) >= 400 and rng.random() < 0.35:
+        notches.append(-sign * rng.randint(30, 90))
+    return notches
+
+def path_points(x0, y0, x1, y1, rng=random):
+    """Cursor waypoints to the target: a slight perpendicular bow, fast start,
+    decelerating approach, hand tremor. The final point lands exactly on target."""
+    dx, dy = x1 - x0, y1 - y0
+    distance = math.hypot(dx, dy)
+    if distance < 2:
+        return []
+    steps = 1 if distance < 40 else min(8, max(3, round(distance / 130)))
+    bow = rng.uniform(-1, 1) * min(90, distance * 0.18)
+    unit_x, unit_y = -dy / distance, dx / distance
+    points = []
+    for index in range(1, steps + 1):
+        ease = 1 - (1 - index / steps) ** 2
+        wobble = math.sin(math.pi * ease) * bow
+        points.append((round(x0 + dx * ease + unit_x * wobble + rng.uniform(-2, 2)),
+                       round(y0 + dy * ease + unit_y * wobble + rng.uniform(-2, 2))))
+    points[-1] = (x1, y1)
+    return points
+
+def move_cursor(call, session, x, y):
+    """Send the cursor to (x, y) along a human path, remembering where it rested."""
+    state = _session_state.setdefault(session, {})
+    x0, y0 = state.get("cursor") or (random.randint(160, 960), random.randint(120, 660))
+    state["cursor"] = (x, y)
+    points = path_points(x0, y0, x, y)
+    for point_x, point_y in points[:-1]:
+        call("Input.dispatchMouseEvent", type="mouseMoved", x=point_x, y=point_y)
+        time.sleep(random.uniform(0.010, 0.026))
+    if points:
+        call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
 
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
@@ -47,7 +208,10 @@ class Browser:
 
     def _attach(self, url, collect_errors, heal_session):
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+        # A fresh plausible window size per run; recordings pin theirs with JEV_VIEWPORT.
+        width, height = viewport_for_run()
+        _session_state[self.session] = {"viewport": (width, height)}
+        self.call("Emulation.setDeviceMetricsOverride", width=width, height=height, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         # Error evidence: console errors, uncaught exceptions, failed/4xx+ requests. A model
@@ -64,7 +228,16 @@ class Browser:
         self.session_events = []
         self._network_enabled = bool(collect_errors or heal_session)
         if self.collect_errors:
-            self.call("Runtime.enable")
+            if os.environ.get("JEV_RUNTIME_ERRORS") == "1":
+                # Deep capture for debugging; pages can observe Runtime.enable.
+                self.call("Runtime.enable")
+            else:
+                # Passive in-page collectors keep exception evidence without Runtime.enable.
+                # Without Page.enable the injection below is silently ignored.
+                self.call("Page.enable")
+                self.call("Page.addScriptToEvaluateOnNewDocument", source=PAGE_ERROR_COLLECTOR)
+            # Log entries are browser-side records (network, CSP); enabling the
+            # domain changes nothing the page can see.
             self.call("Log.enable")
         if self._network_enabled:
             self.call("Network.enable")
@@ -303,8 +476,8 @@ class Browser:
             try:
                 self.call(
                     "Runtime.evaluate",
-                    expression="""(action => new Promise(resolve => {
-                      const field=window.__jevFast?.nodes.get(action.node);
+                    expression=_js("""(action => new Promise(resolve => {
+                      const field=window[__JEV_KEY__]?.nodes.get(action.node);
                       const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
                       let frames=0, stopped=false;
                       const finish=()=>{stopped=true;resolve()};
@@ -323,22 +496,37 @@ class Browser:
                         else requestAnimationFrame(ready);
                       };
                       requestAnimationFrame(ready);
-                    }))(""" + json.dumps(action) + ")",
+                    }))(""") + json.dumps(action) + ")",
                     awaitPromise=True,
                     returnByValue=True,
                 )
             except RuntimeError:
                 pass
+        info = None
         for attempt in range(10):
             try:
-                return browser_operation(
+                info = browser_operation(
                     {"operation": "observe", "session": self.session, "screenshot": screenshot}
                 )
+                break
             except StalePage:
                 if attempt == 9:
                     raise
                 time.sleep(0.02)
-        raise StalePage("Page did not settle")
+        self._ingest_page_errors(info)
+        return info
+
+    def _ingest_page_errors(self, info):
+        """Collector events become evidence like protocol events; the in-page copy clears after."""
+        page_errors = info.pop("page_errors", None) if info else None
+        if not page_errors:
+            return
+        for item in page_errors:
+            self._record(item.get("kind", "exception"), item.get("text", ""), item.get("url", ""))
+        try:
+            self.evaluate(_js("window[__JEV_KEY__].page_errors.length=0"))
+        except (StalePage, RuntimeError):
+            pass
 
     def fresh(self, page, action=None):
         if action is not None and action["kind"] in {"click", "select", "file"}:
@@ -346,8 +534,8 @@ class Browser:
             if type(node) is not int:
                 return False
             current = self.evaluate(
-                "(() => { const c=window.__jevFast; "
-                f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
+                _js("(() => { const c=window[__JEV_KEY__]; ")
+                + f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
             )
             return current == [page["page_key"], page["guards"].get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
@@ -370,6 +558,8 @@ class Browser:
                 cdp("Target.closeTarget", targetId=self.target)
             except Exception:
                 pass
+        if getattr(self, "session", None):
+            _session_state.pop(self.session, None)
         self.target = None
 
 
@@ -397,15 +587,25 @@ def browser_operation(request):
         action = request["action"]
         kind = action["kind"]
         if kind == "scroll":
-            call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+            # The wheel rests somewhere, ticks in notches with a decaying tail, and the
+            # hand trembles a little between ticks.
+            wheel_x, wheel_y = scroll_point(session)
+            move_cursor(call, session, wheel_x, wheel_y)
+            for index, notch in enumerate(wheel_plan(action["delta"])):
+                if index:
+                    time.sleep(min(0.12, random.uniform(0.02, 0.04) * (1.25 ** index)))
+                call("Input.dispatchMouseEvent", type="mouseWheel",
+                     x=max(0, wheel_x + random.randint(-6, 6)),
+                     y=max(0, wheel_y + random.randint(-4, 4)),
+                     deltaX=0, deltaY=notch)
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             if kind == "file" and not (request.get("files") or []):
                 raise ValueError("SET_FILE needs operator-provided file paths; none were given.")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
-            target = evaluate("""(action => {
-              const e=window.__jevFast?.nodes.get(action.node);
+            target = evaluate(_js("""(action => {
+              const e=window[__JEV_KEY__]?.nodes.get(action.node);
               if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
                   !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
@@ -413,14 +613,15 @@ def browser_operation(request):
               if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
               if (!e.contains(document.elementFromPoint(x,y))) return null;
               if (action.kind==='select') {
-                if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
-                    !o.disabled && !o.closest('optgroup[disabled]'))) return null;
-                e.value=action.value;
-                e.dispatchEvent(new Event('input',{bubbles:true}));
-                e.dispatchEvent(new Event('change',{bubbles:true}));
+                if (e.tagName!=='SELECT') return null;
+                const selectable=[...e.options].filter(o=>!o.disabled && !o.closest('optgroup[disabled]'));
+                const option=selectable.find(o=>o.value===action.value);
+                if (!option) return null;
+                const current=e.selectedOptions[0] ? selectable.indexOf(e.selectedOptions[0]) : -1;
+                return {x,y,steps:selectable.indexOf(option)-current};
               }
               return {x,y};
-            })(""" + json.dumps(action) + ")")
+            })(""") + json.dumps(action) + ")")
             if target is None:
                 if kind == "select":
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
@@ -433,7 +634,7 @@ def browser_operation(request):
                     raise ValueError("SET_FILE needs operator-provided file paths; none were given.")
                 remote = call(
                     "Runtime.evaluate",
-                    expression=f"window.__jevFast.nodes.get({action['node']})",
+                    expression=f"window[{_KEY_JSON}].nodes.get({action['node']})",
                     returnByValue=False,
                     objectGroup="jev-setfile",
                 )
@@ -447,17 +648,48 @@ def browser_operation(request):
                 call("DOM.setFileInputFiles", files=files, nodeId=node)
                 call("Runtime.releaseObjectGroup", objectGroup="jev-setfile")
                 set_count = evaluate(
-                    f"(() => {{ const e = window.__jevFast.nodes.get({action['node']});"
+                    f"(() => {{ const e = window[{_KEY_JSON}].nodes.get({action['node']});"
                     " e.dispatchEvent(new Event('input',{bubbles:true}));"
                     " e.dispatchEvent(new Event('change',{bubbles:true}));"
                     " return e.files.length; })()"
                 )
                 if set_count != len(files):
                     raise StalePage("File attachment was not confirmed; inspect before retrying.")
-            elif kind != "select":
+            elif kind == "select":
+                steps = int(target.get("steps") or 0)
+                committed = steps == 0
+                if steps and sys.platform != "darwin":
+                    # Arrows on a focused select commit through native trusted input/change events.
+                    try:
+                        evaluate(_js(f"window[__JEV_KEY__].nodes.get({action['node']}).focus()"))
+                        direction = "Down" if steps > 0 else "Up"
+                        for _ in range(abs(steps)):
+                            params = arrow_params(direction)
+                            call("Input.dispatchKeyEvent", type="keyDown", **params)
+                            call("Input.dispatchKeyEvent", type="keyUp", **params)
+                            time.sleep(random.uniform(0.004, 0.02))
+                        committed = evaluate(_js(
+                            f"window[__JEV_KEY__].nodes.get({action['node']})?.value === "
+                            + json.dumps(action["value"])))
+                    except (StalePage, RuntimeError):
+                        committed = False
+                if not committed and not evaluate(_js(
+                        "(node => { const e=window[__JEV_KEY__].nodes.get(node);"
+                        " if (!e) return false;"
+                        " e.value=" + json.dumps(action["value"]) + ";"
+                        " e.dispatchEvent(new Event('input',{bubbles:true}));"
+                        " e.dispatchEvent(new Event('change',{bubbles:true}));"
+                        " return e.value===" + json.dumps(action["value"]) + ";"
+                        f"}})({action['node']})")):
+                    raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
+            else:
                 x, y = target["x"], target["y"]
-                for event in ("mousePressed", "mouseReleased"):
-                    call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+                # The hand travels to the control along a curved path before it presses.
+                move_cursor(call, session, x, y)
+                time.sleep(random.uniform(0.008, 0.03))
+                call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=1)
+                time.sleep(random.uniform(0.015, 0.06))
+                call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
                 if kind == "fill":
                     call(
                         "Input.dispatchKeyEvent",
@@ -474,7 +706,16 @@ def browser_operation(request):
                         code="KeyA",
                         modifiers=4 if sys.platform == "darwin" else 2,
                     )
-                    call("Input.insertText", text=request["text"])
+                    mode, body = typing_plan(request["text"] or "")
+                    if mode == "keys":
+                        gaps = typing_gaps(body)
+                        for index, char in enumerate(body):
+                            call("Input.dispatchKeyEvent", type="keyDown", **char_key_params(char))
+                            call("Input.dispatchKeyEvent", type="keyUp", **char_key_params(char, press=False))
+                            if index < len(gaps):
+                                time.sleep(gaps[index])
+                    elif request["text"]:
+                        call("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
     info = evaluate(READ_STATE)

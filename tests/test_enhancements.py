@@ -202,3 +202,20 @@ def test_stale_navigation_tick_still_counts_toward_stall(runner, monkeypatch):
 def test_fingerprint_helper_is_untouched():
     p = page()
     assert fingerprint(p) == fingerprint(p)
+
+
+def test_dwell_is_off_by_default_and_opt_in_via_environment(runner, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("jev_ultrafast.agent.time.sleep", sleeps.append)
+    monkeypatch.delenv("JEV_DWELL_MS", raising=False)
+    loop._dwell(runner.state)
+    assert sleeps == []  # the loop stays ultrafast unless the operator asks for pacing
+    monkeypatch.setenv("JEV_DWELL_MS", "200-400")
+    loop._dwell(runner.state)
+    assert 0.2 <= sleeps[-1] <= 0.4
+    runner.state["history"] = [{"page_changed": True}]
+    loop._dwell(runner.state)
+    assert 0.3 <= sleeps[-1] <= 0.6  # 1.5x after the page changed
+    monkeypatch.setenv("JEV_DWELL_MS", "nonsense")
+    with pytest.raises(ValueError, match="JEV_DWELL_MS"):
+        loop._dwell(runner.state)

@@ -1,6 +1,12 @@
 (() => {
   if (!document.body) return null;
-  const cache = window.__jevFast ||= {ids:new WeakMap(), nodes:new Map(), next:1};
+  // browser.py substitutes a random key per process and installs the property as
+  // non-enumerable, so no page can enumerate or guess the session's node cache.
+  const key=__JEV_KEY__;
+  if (!window[key]) Object.defineProperty(window,key,
+    {value:{},enumerable:false,configurable:true,writable:true});
+  const cache=window[key];
+  cache.ids??=new WeakMap(); cache.nodes??=new Map(); cache.next??=1; cache.page_errors??=[];
   const identity = e => {
     if (!cache.ids.has(e)) cache.ids.set(e,cache.next++);
     const id=cache.ids.get(e); cache.nodes.set(id,e); return id;
@@ -106,5 +112,6 @@
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,
+    page_errors:[...cache.page_errors]};
 })()

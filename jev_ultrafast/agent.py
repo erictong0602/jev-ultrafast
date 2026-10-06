@@ -1,6 +1,8 @@
 """The complete agent loop. Typed choices, observable state, bounded execution."""
 
 import base64
+import os
+import random
 import time
 from pathlib import Path
 
@@ -14,6 +16,25 @@ class BudgetExhausted(ValueError):
 
 class Stalled(ValueError):
     """Consecutive decisions executed no action; the run made no progress."""
+
+
+def _dwell(state):
+    """Opt-in reading pause before an action, JEV_DWELL_MS='min' or 'min-max' in
+    milliseconds. Off by default: the loop's speed is the product, so a human
+    cadence is something the operator chooses, with a longer pause after a page change."""
+    spec = os.environ.get("JEV_DWELL_MS", "").strip()
+    if not spec:
+        return
+    try:
+        bounds = sorted(float(part) for part in spec.replace("-", " ").split())
+    except ValueError:
+        raise ValueError("JEV_DWELL_MS is 'min' or 'min-max' in milliseconds, e.g. 300-1200") from None
+    if len(bounds) > 2 or bounds[0] < 0:
+        raise ValueError("JEV_DWELL_MS is 'min' or 'min-max' in milliseconds, e.g. 300-1200")
+    high = bounds[-1]
+    low = bounds[0]
+    changed = bool(state["history"] and state["history"][-1].get("page_changed"))
+    time.sleep(random.uniform(low, high) / 1000 * (1.5 if changed else 1.0))
 
 
 class Agent:
@@ -152,6 +173,7 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
+            _dwell(state)
             state["browser"].act(action, page, text=text,
                                  files=state.get("files") if action["kind"] == "file" else None)
             self.pending_text = None

@@ -4,12 +4,18 @@ The profile lives on disk, so a sign-in survives restarts like a normal
 browser, and a dedicated user-data-dir avoids the per-connection
 "Allow remote debugging" popup Chrome 144+ shows on the daily profile.
 
-One profile per project keeps test accounts and sessions apart:
+One profile per project keeps test accounts and sessions apart. One unique
+BU_NAME per session keeps concurrent jev runs from sharing a browser:
+daemons are keyed by BU_NAME and each daemon serves exactly one Chrome,
+so a second session that changes only the endpoint would silently reuse
+the first session's browser (jev fails loudly on that since this guard
+exists — Browser checks the live daemon against the requested endpoint).
 
   uv run python scripts/automation_chrome.py                    # default profile
   uv run python scripts/automation_chrome.py --profile staging  # ~/.jev-ultrafast/profiles/staging
   uv run python scripts/automation_chrome.py --list
-  export BU_CDP_WS=<the printed ws:// URL>
+  export BU_NAME=staging                     # unique per parallel session; pairs with --profile
+  export BU_CDP_URL=http://127.0.0.1:9334    # printed below; stable across Chrome restarts
   uv run jev
 """
 
@@ -32,11 +38,23 @@ parser.add_argument("--list", action="store_true", help="List known profiles and
 args = parser.parse_args()
 
 
+def safe_name(value):
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in value)
+
+
 def profile_dir():
     if args.profile:
-        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in args.profile)
-        return ROOT / "profiles" / safe
+        return ROOT / "profiles" / safe_name(args.profile)
     return PROFILE
+
+
+def print_exports(port):
+    """The two env vars a session needs; both or neither, or isolation is not real."""
+    print(f"export BU_CDP_URL=http://127.0.0.1:{port}")
+    if args.profile:
+        print(f"export BU_NAME={safe_name(args.profile)}")
+    else:
+        print("# Parallel sessions: pass --profile <name> to also get a unique BU_NAME for this browser.")
 
 
 def port_for(directory):
@@ -95,6 +113,14 @@ def devtools_ws(directory, port):
         return None
 
 
+def serving_port(ws, fallback):
+    """The port DevTools actually answered on, when known."""
+    try:
+        return int(ws.split(":", 3)[2].split("/", 1)[0])
+    except (IndexError, ValueError):
+        return fallback
+
+
 def main():
     if args.list:
         default = PROFILE
@@ -114,8 +140,9 @@ def main():
         except Exception:
             ws = None
     if ws:
-        print(f"Chrome is already serving {directory} on port {port}.")
-        print(f"BU_CDP_WS={ws}")
+        live = serving_port(ws, port)
+        print(f"Chrome is already serving {directory} on port {live}.")
+        print_exports(live)
         return
 
     binary = chrome_binary()
@@ -137,7 +164,7 @@ def main():
     while time.monotonic() < deadline:
         if ws := devtools_ws(directory, port):
             print(f"Dedicated automation Chrome is running with profile {directory} on port {port}.")
-            print(f"BU_CDP_WS={ws}")
+            print_exports(port)
             return
         time.sleep(0.5)
     raise SystemExit(f"Chrome did not open its DevTools port within 30s; is port {port} free?")

@@ -9,10 +9,11 @@ import re
 import secrets
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from browser_harness.admin import ensure_daemon
+from browser_harness.admin import daemon_alive, ensure_daemon
 from browser_harness.helpers import cdp, drain_events
 
 # Each process hides its snapshot cache under a fresh, non-enumerable window property.
@@ -190,9 +191,67 @@ REQUEST_URL_LIMIT = 1000
 AUTH_FAILURE_STATUSES = (401, 403)
 
 
+def _desired_endpoint_base():
+    """http(s) base of the browser BU_CDP_WS/BU_CDP_URL names, or None for local discovery."""
+    raw = (os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL") or "").strip()
+    if not raw:
+        return None
+    scheme, _, rest = raw.partition("://")
+    base = {"ws": "http", "wss": "https"}.get(scheme, scheme)
+    if base not in ("http", "https") or not rest:
+        raise ValueError(f"BU_CDP_WS/BU_CDP_URL must be a ws:// or http:// endpoint, got {raw!r}")
+    return f"{base}://{rest.split('/', 1)[0]}"
+
+
+def _endpoint_page_ids(endpoint):
+    """Page target IDs at a DevTools HTTP endpoint. Chrome mints target IDs per
+    browser instance, so these identify the exact Chrome serving the endpoint."""
+    with urllib.request.urlopen(f"{endpoint}/json/list", timeout=5) as response:
+        return {target["id"] for target in json.loads(response.read()) if target.get("type") == "page"}
+
+
+def ensure_isolated_daemon():
+    """Attach to a daemon that serves the browser this session's environment names.
+
+    Daemons are keyed by BU_NAME (default "default") and a daemon serves exactly
+    one Chrome. A second process that sets only BU_CDP_WS/BU_CDP_URL would
+    silently reuse a live daemon's browser — its profile cookies, and session
+    healing or cache clears included. Disjoint page target IDs between the live
+    daemon and the requested endpoint prove two different Chrome instances; that
+    silent-sharing case fails loudly instead."""
+    endpoint = _desired_endpoint_base()
+    if endpoint is None or not daemon_alive():
+        ensure_daemon()
+        return
+    try:
+        wanted = _endpoint_page_ids(endpoint)
+    except Exception as error:
+        raise RuntimeError(
+            f"{endpoint} from BU_CDP_WS/BU_CDP_URL is not reachable ({error}). "
+            "Start the Chrome that serves it, or unset both variables to use local discovery."
+        ) from error
+    try:
+        attached = {info.get("targetId") for info in cdp("Target.getTargets").get("targetInfos", [])
+                    if info.get("type") == "page"}
+    except Exception:
+        ensure_daemon()  # Stale daemon; its self-heal replaces it with one bound to our env.
+        return
+    if wanted & attached:
+        ensure_daemon()
+        return
+    raise RuntimeError(
+        f"A browser-harness daemon is already serving a different browser than {endpoint}. "
+        "Sharing its BU_NAME would drive one Chrome from both sessions: the same profile "
+        "cookies, and each session's healing or cache clears landing in the other's tab. "
+        "Give this session its own browser: `python scripts/automation_chrome.py --profile <name>`, "
+        "then export BU_NAME=<name> and BU_CDP_URL=<its port>. If sharing is intended, stop the "
+        "other session or its daemon first (`browser-harness --reload`)."
+    )
+
+
 class Browser:
     def __init__(self, url, *, foreground=False, keep_open=False, collect_errors=True, heal_session=True):
-        ensure_daemon()
+        ensure_isolated_daemon()
         self.keep_open = keep_open
         self.target = cdp("Target.createTarget", url="about:blank", background=not foreground)["targetId"]
         try:
@@ -245,14 +304,25 @@ class Browser:
         password = os.environ.get("JEV_BASIC_AUTH_PASSWORD")
         if (username is None) != (password is None):
             raise ValueError("JEV_BASIC_AUTH_USERNAME and JEV_BASIC_AUTH_PASSWORD must be set together")
-        self.auth_origin = urlparse(url).netloc if username is not None else None
+        # Credentials serve one origin: JEV_BASIC_AUTH_ORIGIN (comma-separated) when set,
+        # otherwise the landing origin. Every other origin skips interception entirely,
+        # so credentials added for one protected host never touch unrelated runs.
+        origin = urlparse(url).netloc
+        scope = {s.strip() for s in os.environ.get("JEV_BASIC_AUTH_ORIGIN", "").split(",") if s.strip()}
+        self.auth_origin = origin if username is not None and (not scope or origin in scope) else None
         self.auth_username = username
         self.auth_password = password
         if self.auth_origin:
+            # Intercept document navigations only, at the request stage. Intercepting every
+            # response of an origin stalls SPA data calls: the app shell loads, its XHRs hang
+            # off-page, and the loop observes a permanently blank page. Answering one document
+            # challenge caches the credentials, which Chrome then attaches to same-origin
+            # subresources itself.
             self.call(
                 "Fetch.enable",
                 handleAuthRequests=True,
-                patterns=[{"urlPattern": f"https://{self.auth_origin}/*", "requestStage": "Response"}],
+                patterns=[{"urlPattern": f"https://{self.auth_origin}/*",
+                           "requestStage": "Request", "resourceType": "Document"}],
             )
         self._load(url)
         if heal_session:

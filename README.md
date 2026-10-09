@@ -65,6 +65,19 @@ Open **http://127.0.0.1:8766** and click **Start demo → Run automatically**. T
 
 Chrome connects through [Browser Harness](https://github.com/browser-use/browser-harness), installed by `uv sync`. Run `uv run browser-harness --doctor` if it needs connecting. Allow remote debugging in Chrome when prompted.
 
+### One browser per session
+
+All jev processes on a machine share one browser-harness daemon (keyed by `BU_NAME`, default `"default"`), and one daemon serves one Chrome. Two concurrent runs under the same name share that browser's profile cookies, and either run's session healing or `scripts/session.py` clearing lands in both. Give each concurrent session its own browser:
+
+```bash
+uv run python scripts/automation_chrome.py --profile agentA   # prints the two exports
+export BU_NAME=agentA
+export BU_CDP_URL=http://127.0.0.1:9333
+uv run jev
+```
+
+Each named profile keeps its own port and its own persistent logins. A session that names an endpoint (`BU_CDP_WS`/`BU_CDP_URL`) refuses to start when a live daemon serves a different Chrome, instead of silently sharing it.
+
 `TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current demo uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper; configure the appropriate model, endpoint, and reasoning setting.
 
 ## Use the library

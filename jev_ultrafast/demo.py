@@ -10,10 +10,23 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .agent import Agent
+from .coordination import agent_name, worker_port
 from .questions import MAX_STEPS
 
 ROOT = Path(__file__).parent
-PORT = int(os.environ.get("TYPESAFE_DEMO_PORT", "8766"))
+
+
+def _demo_port():
+    """One inspector per agent: a named agent gets a stable port of its own so
+    several demo UIs coexist; TYPESAFE_DEMO_PORT stays the explicit override."""
+    spec = os.environ.get("TYPESAFE_DEMO_PORT", "").strip()
+    if spec:
+        return int(spec)
+    name = agent_name()
+    return worker_port(name) if name != "default" else 8766
+
+
+PORT = _demo_port()
 ORIGIN = f"http://127.0.0.1:{PORT}"
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()

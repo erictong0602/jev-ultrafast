@@ -18,7 +18,8 @@ from pathlib import Path
 
 from jev_ultrafast import Agent
 from jev_ultrafast.agent import BudgetExhausted, Stalled
-from jev_ultrafast.browser import cdp
+from jev_ultrafast.browser import AGENT_NAME, OriginBusy, cdp
+from jev_ultrafast.coordination import append_record
 from jev_ultrafast.reporting import (
     build_record,
     check_expectations,
@@ -48,6 +49,8 @@ parser.add_argument("--no-heal", action="store_true",
                     help="Disable session healing for this sweep (never reload or clear storage).")
 parser.add_argument("--file", action="append",
                     help="Local file the agent may attach to a file input (repeatable; enables SET_FILE).")
+parser.add_argument("--origin-wait", type=int, default=0,
+                    help="Seconds to wait for a same-origin lock held by another agent (default 0: fail fast).")
 args = parser.parse_args()
 
 if args.urls and args.url:
@@ -69,6 +72,7 @@ def agent_options():
     names = {"foreground": args.foreground, "keep_open": args.keep_open,
              "heal_session": not args.no_heal}
     options = {k: v for k, v in names.items() if v}
+    options["origin_wait"] = args.origin_wait
     if args.file:
         options["files"] = args.file
     for flag, key in (("--max-actions", "max_actions"), ("--max-decisions", "max_decisions"),
@@ -127,6 +131,8 @@ def run_one(url, expect_url, expect_text):
     except (BudgetExhausted, Stalled) as error:
         status = "budget_exhausted" if isinstance(error, BudgetExhausted) else "stalled"
         detail = str(error)
+    except OriginBusy as error:
+        status, detail = "origin_busy", str(error)
     except ValueError as error:
         if "TEXT_MODEL_API_KEY" in str(error):
             # Typing without a text key is a supported-operation gap, not a crash: the run hit a
@@ -157,6 +163,7 @@ def run_one(url, expect_url, expect_text):
         decisions=len((state or {}).get("decisions", [])),
         elapsed_ms=(state or {}).get("elapsed_ms", 0),
         errors=errors, expectations=expectations, heal_events=heal_events,
+        agent=AGENT_NAME,
     )
     record["ts"] = int(time.time())
     screenshot = failure_evidence(agent, url, status, expectations)
@@ -177,23 +184,18 @@ def run_one(url, expect_url, expect_text):
     return record
 
 
-out = open(args.jsonl, "a", encoding="utf-8") if args.jsonl else None
 records = []
-try:
-    for target, expect_url, expect_text in page_specs():
-        record = run_one(target, expect_url, expect_text)
-        records.append(record)
-        line = json.dumps(record)
-        if out:
-            out.write(line + "\n")
-            out.flush()
-        if args.json:
-            print(line)
-        elif args.urls:
-            print(f"== {record['status']}  actions={record['actions']}  errors={record['errors']['counts']}  {target}")
-finally:
-    if out:
-        out.close()
+for target, expect_url, expect_text in page_specs():
+    record = run_one(target, expect_url, expect_text)
+    records.append(record)
+    line = json.dumps(record)
+    if args.jsonl:
+        # Locked append: concurrent agents may share one results file.
+        append_record(args.jsonl, record)
+    if args.json:
+        print(line)
+    elif args.urls:
+        print(f"== {record['status']}  actions={record['actions']}  errors={record['errors']['counts']}  {target}")
 if args.urls and records:
     bad = [r["url"] for r in records if not record_passed(r)]
     verdict = f"{len(records) - len(bad)}/{len(records)} pages verified"

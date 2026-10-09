@@ -13,8 +13,20 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from browser_harness.admin import daemon_alive, ensure_daemon
-from browser_harness.helpers import cdp, drain_events
+from .coordination import OriginLock, agent_name
+
+# One browser-harness daemon per agent name: parallel agents each get their own
+# daemon, tab, and CDP event stream against the shared Chrome, so nobody drains
+# another agent's events. The harness reads BU_NAME at import time, so the name
+# is settled before those imports run.
+AGENT_NAME = agent_name()
+if os.environ.get("BU_NAME") != AGENT_NAME:
+    os.environ["BU_NAME"] = AGENT_NAME
+
+# Deliberately after the BU_NAME settlement above: the harness snapshots its
+# name from the environment at import time.
+from browser_harness.admin import daemon_alive, ensure_daemon  # noqa: E402
+from browser_harness.helpers import cdp, drain_events  # noqa: E402
 
 # Each process hides its snapshot cache under a fresh, non-enumerable window property.
 # getOwnPropertyNames still lists hidden properties, so the key carries no recognizable
@@ -182,6 +194,10 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+class OriginBusy(ValueError):
+    """Another live agent holds this site's origin lock. Work elsewhere or wait longer."""
+
+
 # Cap stored evidence so a noisy page cannot grow memory unbounded; counts keep rising.
 ERROR_ITEM_LIMIT = 100
 REQUEST_URL_LIMIT = 1000
@@ -250,20 +266,36 @@ def ensure_isolated_daemon():
 
 
 class Browser:
-    def __init__(self, url, *, foreground=False, keep_open=False, collect_errors=True, heal_session=True):
-        ensure_isolated_daemon()
-        self.keep_open = keep_open
-        self.target = cdp("Target.createTarget", url="about:blank", background=not foreground)["targetId"]
+    def __init__(self, url, *, foreground=False, keep_open=False, collect_errors=True,
+                 heal_session=True, origin_wait=0, lock_origin=True):
+        # The origin lock comes first: a busy site is refused before any daemon,
+        # tab, or billed work happens. Automatic healing never clears a site
+        # another live agent holds (heal() checks contested() at clear time).
+        lock = OriginLock(urlparse(url).netloc) if lock_origin else None
+        if lock is not None and not lock.acquire(wait_s=origin_wait):
+            raise OriginBusy(
+                f"another live agent holds {urlparse(url).netloc}; "
+                "pass a longer --origin-wait to queue, or run a different origin"
+            )
         try:
-            self._attach(url, collect_errors, heal_session)
-        except BaseException:
-            # A wedged page must not leak a tab in unattended batch runs.
+            ensure_isolated_daemon()
+            self.keep_open = keep_open
+            self.target = cdp("Target.createTarget", url="about:blank", background=not foreground)["targetId"]
             try:
-                cdp("Target.closeTarget", targetId=self.target)
-            except Exception:
-                pass
-            self.target = None
+                self._attach(url, collect_errors, heal_session)
+            except BaseException:
+                # A wedged page must not leak a tab in unattended batch runs.
+                try:
+                    cdp("Target.closeTarget", targetId=self.target)
+                except Exception:
+                    pass
+                self.target = None
+                raise
+        except BaseException:
+            if lock is not None:
+                lock.release()
             raise
+        self.origin_lock = lock
 
     def _attach(self, url, collect_errors, heal_session):
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
@@ -432,6 +464,12 @@ class Browser:
             self.session_events.append("reload restored the session")
             return
         stale = self.cookies(url)
+        if OriginLock.contested(urlparse(url).netloc):
+            # Another live agent is working on this site; clearing its cookies
+            # would sign that agent out mid-task. A dead holder's lock is gone,
+            # so this never blocks recovery of an abandoned session.
+            self.session_events.append("another agent holds this origin; cookies kept")
+            return
         self.clear_cookies(url)
         self.clear_cache()
         origin = urlparse(self.document_url or url).netloc
@@ -631,6 +669,9 @@ class Browser:
         if getattr(self, "session", None):
             _session_state.pop(self.session, None)
         self.target = None
+        if getattr(self, "origin_lock", None) is not None:
+            self.origin_lock.release()
+            self.origin_lock = None
 
 
 def fingerprint(state):

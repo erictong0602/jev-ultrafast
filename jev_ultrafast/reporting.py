@@ -116,9 +116,12 @@ def check_expectations(page, expect_url=None, expect_text=None):
 
 
 def build_record(*, url, status, detail="", page=None, actions=0, decisions=0, elapsed_ms=0,
-                 errors=None, expectations=None, heal_events=None):
-    """One JSON-serializable outcome row: the judgment, its evidence, and any expectation results."""
-    return {
+                 errors=None, expectations=None, heal_events=None, agent=None):
+    """One JSON-serializable outcome row: the judgment, its evidence, and any expectation results.
+
+    agent names the process that produced the row, so results from concurrent
+    agents sharing one results file stay attributable."""
+    record = {
         "url": url,
         "status": status,
         "detail": detail,
@@ -130,3 +133,6 @@ def build_record(*, url, status, detail="", page=None, actions=0, decisions=0, e
         "expectations": expectations,
         "heal_events": heal_events or [],
     }
+    if agent is not None:
+        record["agent"] = agent
+    return record

@@ -51,7 +51,8 @@ def _dwell(state):
 class Agent:
     def __init__(self, url, goals, *, record_dir=None, screenshots=False, foreground=False,
                  keep_open=False, collect_errors=True, heal_session=True, files=None,
-                 max_actions=MAX_STEPS, max_decisions=MAX_STEPS * 2, max_stall=12, choose_retries=2):
+                 max_actions=MAX_STEPS, max_decisions=MAX_STEPS * 2, max_stall=12, choose_retries=2,
+                 origin_wait=0):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
@@ -63,7 +64,8 @@ class Agent:
             if not Path(path).is_file():
                 raise ValueError(f"File to upload does not exist: {path}")
         self.browser = Browser(url, foreground=foreground, keep_open=keep_open,
-                               collect_errors=collect_errors, heal_session=heal_session)
+                               collect_errors=collect_errors, heal_session=heal_session,
+                               origin_wait=origin_wait)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:

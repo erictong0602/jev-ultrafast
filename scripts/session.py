@@ -62,7 +62,8 @@ if args.command == "tabs":
         print(f"closed {len(closing)} tab(s) matching {args.close!r}")
     raise SystemExit(0)
 
-browser = Browser(args.url, collect_errors=True, heal_session=False)
+# Operator override: inspect/clear a site even while an agent works on it.
+browser = Browser(args.url, collect_errors=True, heal_session=False, lock_origin=False)
 try:
     if args.command == "status":
         pattern = os.environ.get("JEV_LOGIN_URL_PATTERN", "").strip()

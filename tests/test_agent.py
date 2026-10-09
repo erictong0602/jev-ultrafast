@@ -318,3 +318,59 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def blank_page():
+    return {
+        "url": "https://app.test/",
+        "title": "App",
+        "text": "",
+        "actions": [{"id": "wait", "kind": "wait", "label": "Wait for the page to update"}],
+        "fingerprint": "blank-shell",
+    }
+
+
+def settling_agent(browser):
+    a = loop.Agent.__new__(loop.Agent)
+    a.screenshots = False
+    a.state = {
+        "browser": browser,
+        "page": blank_page(),
+        "decision": None,
+        "goal": "Find a book",
+        "history": [],
+        "decisions": [],
+        "status": "ready",
+        "started_at": time.perf_counter(),
+        "record": False,
+        "text_calls": [],
+    }
+    return a
+
+
+def test_blank_first_observation_settles_before_the_billed_decision(monkeypatch):
+    monkeypatch.setattr(loop, "BLANK_POLL_S", 0)
+    monkeypatch.setattr(loop, "BLANK_SETTLE_S", 0.05)
+    content = page()
+    browser = Mock(fresh=Mock(side_effect=[True, False]), observe=Mock(return_value=content))
+    agent = settling_agent(browser)
+    chosen = decision("e3")
+    monkeypatch.setattr(loop, "choose", Mock(return_value=chosen))
+    agent.command("predict", {})
+    assert agent.state["page"] is content  # The model was shown the rendered page, not the boot shell.
+    browser.observe.assert_called_once()
+    loop.choose.assert_called_once()
+    assert loop.choose.call_args[0][0] is content
+
+
+def test_a_page_that_stays_blank_still_gets_its_decision(monkeypatch):
+    monkeypatch.setattr(loop, "BLANK_POLL_S", 0)
+    monkeypatch.setattr(loop, "BLANK_SETTLE_S", 0.02)
+    browser = Mock(fresh=Mock(return_value=True), observe=Mock())
+    agent = settling_agent(browser)
+    blank = agent.state["page"]
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    agent.command("predict", {})
+    browser.observe.assert_not_called()  # Nothing changed; settling polls quietly and gives up.
+    assert loop.choose.call_args[0][0] is blank
+    assert agent.state["status"] == "predicted"

@@ -18,6 +18,17 @@ class Stalled(ValueError):
     """Consecutive decisions executed no action; the run made no progress."""
 
 
+# A freshly opened SPA tab can sit on a blank app shell (no text, no controls) while it
+# boots. Settling is free; a decision against the shell is a billed call the model can
+# only answer BLOCKED to.
+BLANK_SETTLE_S = 5.0
+BLANK_POLL_S = 0.25
+
+
+def _has_content(page):
+    return bool(page.get("text")) or any(a["kind"] not in {"scroll", "wait"} for a in page["actions"])
+
+
 def _dwell(state):
     """Opt-in reading pause before an action, JEV_DWELL_MS='min' or 'min-max' in
     milliseconds. Off by default: the loop's speed is the product, so a human
@@ -91,6 +102,22 @@ class Agent:
             "elements": action_space(self.state["page"]["actions"])[0],
         }
 
+    def _settle(self):
+        """Let a blank observed page finish rendering before the next billed decision.
+        Polling observes nothing while the page marker is unchanged; hydration or
+        navigation changes it, and the fresh observation replaces the blank one."""
+        page = self.state["page"]
+        if _has_content(page):
+            return
+        deadline = time.monotonic() + BLANK_SETTLE_S
+        while time.monotonic() < deadline:
+            time.sleep(BLANK_POLL_S)
+            if not self.state["browser"].fresh(page):
+                page = self.state["browser"].observe(screenshot=self.screenshots)
+                self.state["page"] = page
+            if _has_content(page):
+                break
+
     def command(self, name, body=None):
         body = body or {}
         state = self.state
@@ -120,6 +147,7 @@ class Agent:
                 state["started_at"] = time.perf_counter()
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            self._settle()
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")

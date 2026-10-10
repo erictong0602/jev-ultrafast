@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .coordination import OriginLock, agent_name
+from .reporting import redact_url
 
 # One browser-harness daemon per agent name: parallel agents each get their own
 # daemon, tab, and CDP event stream against the shared Chrome, so nobody drains
@@ -67,6 +68,21 @@ PAGE_ERROR_COLLECTOR = _js("""
   });
 })()
 """)
+
+# Why the executor refused an observed target. One vocabulary, shared by the
+# in-page check below, the loop's stop reason, and the run record.
+TARGET_REFUSALS = {
+    "changed": "changed",
+    "gone": "is gone",
+    "disabled": "is disabled",
+    "hidden": "is hidden",
+    "readonly": "is read-only",
+    "no_box": "has no box",
+    "offscreen": "left the viewport",
+    "covered": "is covered by another element",
+    "not_select": "is no longer a dropdown",
+    "option": "lost the requested option",
+}
 
 # Keep typing and clicks inside what a hand on a real keyboard produces.
 TYPE_KEY_LIMIT = 160
@@ -194,6 +210,15 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+class CoveredTarget(StalePage):
+    """A decision whose target another element covers.
+
+    The observation is current and nothing was sent to the page, so the same
+    decision cannot succeed until the covering element goes away. Naming it
+    separately lets the loop stop early and say why, instead of re-deciding
+    blind until the generic stall limit."""
+
+
 class OriginBusy(ValueError):
     """Another live agent holds this site's origin lock. Work elsewhere or wait longer."""
 
@@ -205,6 +230,11 @@ REQUEST_URL_LIMIT = 1000
 # Main-document responses that prove the session is dead. A 200 login page is a soft
 # signal; it only counts when JEV_LOGIN_URL_PATTERN names it.
 AUTH_FAILURE_STATUSES = (401, 403)
+# More than one answered challenge for the same navigation means the provided
+# credentials were rejected. Keep answering would spin the challenge loop the
+# server feeds, so after this many, stop intercepting and let the tab behave
+# like a normal browser (Chrome prompts natively; a person can complete it).
+AUTH_REJECT_LIMIT = 3
 
 
 def _desired_endpoint_base():
@@ -344,71 +374,175 @@ class Browser:
         self.auth_origin = origin if username is not None and (not scope or origin in scope) else None
         self.auth_username = username
         self.auth_password = password
+        self.auth_challenges = 0
         if self.auth_origin:
             # Intercept document navigations only, at the request stage. Intercepting every
             # response of an origin stalls SPA data calls: the app shell loads, its XHRs hang
             # off-page, and the loop observes a permanently blank page. Answering one document
             # challenge caches the credentials, which Chrome then attaches to same-origin
-            # subresources itself.
+            # subresources itself — and only those, unlike a blanket Authorization header.
+            # The scheme comes from the landing URL, so an http staging/lab load is covered
+            # too and the credentials never travel on a scheme the site does not use.
+            scheme = urlparse(url).scheme or "https"
             self.call(
                 "Fetch.enable",
                 handleAuthRequests=True,
-                patterns=[{"urlPattern": f"https://{self.auth_origin}/*",
+                patterns=[{"urlPattern": f"{scheme}://{self.auth_origin}/*",
                            "requestStage": "Request", "resourceType": "Document"}],
             )
         self._load(url)
         if heal_session:
             self.heal(url)
 
-    def _load(self, url):
+    def _document_replaced(self, before):
+        """True once the current document is not the one named by `before`.
+
+        A reload keeps its URL, so document identity comes from
+        performance.timeOrigin (the same signal the snapshot's page key uses).
+        With no readable marker, leave about:blank is the only usable evidence."""
         try:
+            if before is None:
+                href = self.evaluate("location.href")
+                return bool(href) and href != "about:blank"
+            return self.evaluate("performance.timeOrigin") != before
+        except (StalePage, TimeoutError):
+            return False
+
+    def _load(self, url):
+        """Navigate, then wait for the new document while draining the event queue.
+
+        With basic-auth interception the navigation cannot go through a blocking
+        Page.navigate: the challenge that unblocks the request arrives as an
+        event, so a command that waits for the navigation to resolve can never
+        be answered. The challenge itself is answered browser-side, but Chrome
+        swaps the renderer process mid-pause and drops any renderer-bound
+        command (Runtime.evaluate) sent between the detach and the re-attach,
+        so the load wait answers the challenge first and only probes the
+        document once the swap's re-attach has closed that window."""
+        marker = None
+        if self.auth_origin:
+            # Flush pre-navigation attach events: the swap watcher below matches
+            # re-attaches to this tab, and this tab's own attach precedes _load.
+            self._drain()
+            try:
+                marker = self.evaluate("performance.timeOrigin")
+            except (StalePage, TimeoutError):
+                marker = None
+            try:
+                self.evaluate(f"location.assign({json.dumps(url)}); 'navigating'")
+            except (StalePage, TimeoutError):
+                pass
+            answered = detached = reattached = False
+            rejected = False
+            quiet_after = 0
+            swap_by = time.monotonic() + 2.0
+            while time.monotonic() < swap_by:
+                flags = self._drain()
+                answered = answered or flags.get("fetch", False)
+                detached = detached or flags.get("detached", False)
+                reattached = reattached or flags.get("reattached", False)
+                # The swap burst follows the challenge, so the probe only starts
+                # once the re-attach closed the window (or no swap happened and
+                # the stream went quiet after the answer).
+                if answered and (reattached or (not detached and quiet_after >= 3)):
+                    break
+                if answered and not flags:
+                    quiet_after += 1
+                else:
+                    quiet_after = 0
+                if self.auth_challenges >= AUTH_REJECT_LIMIT:
+                    # The server keeps re-challenging: the supplied credentials
+                    # are wrong. Stop intercepting so the tab falls back to
+                    # Chrome's own prompt, and record the rejection as evidence.
+                    try:
+                        self.call("Fetch.disable")
+                    except RuntimeError:
+                        pass
+                    self._record("auth", f"basic auth rejected {self.auth_challenges} times; interception disabled",
+                                 url)
+                    rejected = True
+                    break
+                time.sleep(0.02)
+            if rejected:
+                return
+        else:
             self.call("Page.navigate", url=url)
-        except Exception:
-            # Fetch auth challenges pause navigation until answered. The harness
-            # waits synchronously for Page.navigate, so an authenticated load can
-            # time out here even though its challenge is queued for drain_events.
-            if not self.auth_origin:
-                raise
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             self._drain()
-            if self.evaluate("document.readyState") == "complete":
-                break
+            try:
+                if self.evaluate("document.readyState") == "complete" and (
+                        not self.auth_origin or self._document_replaced(marker)):
+                    break
+            except (StalePage, TimeoutError):
+                pass  # A probe raced the renderer swap; drain again and retry.
             time.sleep(0.02)
 
     def _record(self, kind, text, url=""):
         self.error_counts[kind] = self.error_counts.get(kind, 0) + 1
         if len(self.errors) < ERROR_ITEM_LIMIT:
-            self.errors.append({"kind": kind, "text": text[:300], "url": url[:300]})
+            self.errors.append({"kind": kind, "text": text[:300], "url": redact_url(url)[:300]})
 
     # One drain point for the session: auth challenges must not be starved by error
     # collection, so both route through the same pass over the daemon event queue.
     def _drain(self):
+        """One pass over the daemon's event queue.
+
+        Returns the transition flags the load wait needs: "fetch" (a paused
+        navigation was answered), "detached"/"reattached" (this tab's renderer
+        was swapped). The swap events are browser-level, so they are matched by
+        their params before the session filter drops the rest."""
+        flags = {}
         if not self.auth_origin and not self.collect_errors:
-            return
+            return flags
         for event in drain_events():
-            if event.get("session_id") != self.session:
-                continue
             method = event.get("method")
             params = event.get("params", {})
+            if method == "Target.attachedToTarget":
+                if params.get("targetInfo", {}).get("targetId") == getattr(self, "target", None):
+                    flags["reattached"] = True
+                continue
+            if method == "Target.detachedFromTarget":
+                if params.get("sessionId") == self.session:
+                    flags["detached"] = True
+                continue
+            if event.get("session_id") != self.session:
+                continue
             if method == "Fetch.authRequired":
                 challenge_url = urlparse(params.get("request", {}).get("url", ""))
                 response = "ProvideCredentials" if challenge_url.netloc == self.auth_origin else "CancelAuth"
-                self.call(
-                    "Fetch.continueWithAuth",
-                    requestId=params["requestId"],
-                    authChallengeResponse={
-                        "response": response,
-                        **({"username": self.auth_username, "password": self.auth_password}
-                           if response == "ProvideCredentials" else {}),
-                    },
-                )
+                if response == "ProvideCredentials":
+                    self.auth_challenges += 1
+                try:
+                    self.call(
+                        "Fetch.continueWithAuth",
+                        requestId=params["requestId"],
+                        authChallengeResponse={
+                            "response": response,
+                            **({"username": self.auth_username, "password": self.auth_password}
+                               if response == "ProvideCredentials" else {}),
+                        },
+                    )
+                except RuntimeError as error:
+                    # A rejected credential makes Chrome re-pause under a new id
+                    # before the previous answer lands, and a challenge queued
+                    # before our own Fetch.disable cannot be answered either.
+                    # Neither is a failure of this drain pass.
+                    if "InterceptionId" not in str(error) and "Fetch domain is not enabled" not in str(error):
+                        raise
+                flags["fetch"] = True
             elif method == "Fetch.requestPaused":
                 try:
                     self.call("Fetch.continueRequest", requestId=params["requestId"])
                 except RuntimeError as error:
                     if "Invalid InterceptionId" not in str(error):
                         raise
+                flags["fetch"] = True
+            elif method == "Inspector.detached":
+                # A command sent to the renderer while it is being swapped away
+                # never gets its response, so the load wait must not issue one
+                # between the detach and the re-attach.
+                flags["detached"] = True
             elif method == "Runtime.exceptionThrown":
                 details = params.get("exceptionDetails", {})
                 self._record("exception", details.get("exception", {}).get("description") or details.get("text", ""))
@@ -426,7 +560,9 @@ class Browser:
             elif method == "Network.requestWillBeSent":
                 if len(self._request_urls) >= REQUEST_URL_LIMIT:
                     self._request_urls.clear()
-                self._request_urls[params.get("requestId")] = params.get("request", {}).get("url", "")
+                # A credentialed navigation URL reaches CDP verbatim; evidence keeps the
+                # redacted form so a workaround cannot leak the credential into records.
+                self._request_urls[params.get("requestId")] = redact_url(params.get("request", {}).get("url", ""))
             elif method == "Network.loadingFailed":
                 self._record("request_failed", params.get("errorText", ""),
                              self._request_urls.get(params.get("requestId"), ""))
@@ -434,9 +570,10 @@ class Browser:
                 response = params.get("response", {})
                 if params.get("type") == "Document":
                     self.document_status = response.get("status")
-                    self.document_url = response.get("url", "")
+                    self.document_url = redact_url(response.get("url", ""))
                 if response.get("status", 0) >= 400:
                     self._record("http_status", f"HTTP {response.get('status')}", response.get("url", ""))
+        return flags
 
     def error_summary(self):
         return {"counts": dict(self.error_counts), "items": list(self.errors)}
@@ -715,28 +852,38 @@ def browser_operation(request):
             if kind == "file" and not (request.get("files") or []):
                 raise ValueError("SET_FILE needs operator-provided file paths; none were given.")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
+            # Each refusal names its reason: "no executed action" alone cannot tell an overlay
+            # apart from a navigation after the run, which is how a blocking consent dialog
+            # looked like a page-size problem.
             target = evaluate(_js("""(action => {
+              const R=""" + json.dumps(TARGET_REFUSALS) + """;
               const e=window[__JEV_KEY__]?.nodes.get(action.node);
-              if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
-                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
-              if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
+              if (!e || !e.isConnected) return {blocked:R.gone};
+              if (e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]')) return {blocked:R.disabled};
+              if (!e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return {blocked:R.hidden};
+              if (action.kind==='fill' &&
+                  (e.readOnly || e.getAttribute('aria-readonly')==='true')) return {blocked:R.readonly};
               const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!e.contains(document.elementFromPoint(x,y))) return null;
+              if (!r.width || !r.height) return {blocked:R.no_box};
+              if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) return {blocked:R.offscreen};
+              if (!e.contains(document.elementFromPoint(x,y))) return {blocked:R.covered};
               if (action.kind==='select') {
-                if (e.tagName!=='SELECT') return null;
+                if (e.tagName!=='SELECT') return {blocked:R.not_select};
                 const selectable=[...e.options].filter(o=>!o.disabled && !o.closest('optgroup[disabled]'));
                 const option=selectable.find(o=>o.value===action.value);
-                if (!option) return null;
+                if (!option) return {blocked:R.option};
                 const current=e.selectedOptions[0] ? selectable.indexOf(e.selectedOptions[0]) : -1;
                 return {x,y,steps:selectable.indexOf(option)-current};
               }
               return {x,y};
             })(""") + json.dumps(action) + ")")
-            if target is None:
+            if not isinstance(target, dict) or target.get("blocked"):
+                blocked = target.get("blocked") if isinstance(target, dict) else TARGET_REFUSALS["changed"]
+                if blocked == TARGET_REFUSALS["covered"]:
+                    raise CoveredTarget(f"Target {blocked}; no input was sent.")
                 if kind == "select":
                     raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
-                raise StalePage("Target changed or is covered. Observe again.")
+                raise StalePage(f"Target {blocked}. Observe again.")
             if kind == "file":
                 # The chooser is bypassed entirely: the file comes from the operator,
                 # never from model output, and the change event tells the page.

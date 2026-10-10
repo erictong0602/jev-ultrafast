@@ -25,6 +25,7 @@ from jev_ultrafast.reporting import (
     check_expectations,
     parse_pages_file,
     record_passed,
+    redact_url,
     steps_from_history,
 )
 
@@ -42,6 +43,8 @@ parser.add_argument("--keep-open", action="store_true", help="Leave the tab open
 parser.add_argument("--max-actions", type=int, help="Executed-action budget (default 60).")
 parser.add_argument("--max-decisions", type=int, help="Billed-decision budget (default 120).")
 parser.add_argument("--max-stall", type=int, help="Stop after N consecutive decisions that execute nothing.")
+parser.add_argument("--max-covered", type=int,
+                    help="Stop after N consecutive decisions refused because an overlay covers the target (default 6).")
 parser.add_argument("--retries", type=int, help="Retries for transient invalid model responses (default 2).")
 parser.add_argument("--expect-url", help="Fallback URL substring; a page spec's own expect-url wins.")
 parser.add_argument("--expect-text", help="Fallback page-text substring; a page spec's own expect-text wins.")
@@ -76,7 +79,8 @@ def agent_options():
     if args.file:
         options["files"] = args.file
     for flag, key in (("--max-actions", "max_actions"), ("--max-decisions", "max_decisions"),
-                      ("--max-stall", "max_stall"), ("--retries", "choose_retries")):
+                      ("--max-stall", "max_stall"), ("--max-covered", "max_covered"),
+                      ("--retries", "choose_retries")):
         value = getattr(args, flag.lstrip("-").replace("-", "_"))
         if value is not None:
             options[key] = value
@@ -102,7 +106,7 @@ def failure_evidence(agent, url, status, expectations):
                    format="jpeg", quality=72)
         folder = Path("artifacts/sweep-failures")
         folder.mkdir(parents=True, exist_ok=True)
-        slug = re.sub(r"[^A-Za-z0-9._-]", "_", url.split("://", 1)[-1])[:80]
+        slug = re.sub(r"[^A-Za-z0-9._-]", "_", redact_url(url).split("://", 1)[-1])[:80]
         path = folder / f"{int(time.time())}-{slug}.jpg"
         path.write_bytes(base64.b64decode(shot["data"]))
         return str(path)
@@ -163,6 +167,7 @@ def run_one(url, expect_url, expect_text):
         decisions=len((state or {}).get("decisions", [])),
         elapsed_ms=(state or {}).get("elapsed_ms", 0),
         errors=errors, expectations=expectations, heal_events=heal_events,
+        refusals=(state or {}).get("refusals"),
         agent=AGENT_NAME,
     )
     record["ts"] = int(time.time())

@@ -115,17 +115,37 @@ def check_expectations(page, expect_url=None, expect_text=None):
     return checks
 
 
+def redact_url(url):
+    """A URL with any userinfo removed.
+
+    Credentials belong in the environment (JEV_BASIC_AUTH_*), never in a
+    navigation URL: Chrome answers a credentialed URL itself, which is why it
+    looks like a workaround, but the same URL then travels into evidence —
+    records, failure-screenshot names, and every summary built from them. CDP
+    reports the request URL verbatim, so redaction happens at the recording
+    boundary and the run keeps using the full URL in memory.
+    """
+    text = str(url or "")
+    scheme, separator, rest = text.partition("://")
+    if not separator:
+        return text
+    authority, slash, path = rest.partition("/")
+    if "@" not in authority:
+        return text
+    return f"{scheme}://{authority.rpartition('@')[2]}{slash}{path}"
+
+
 def build_record(*, url, status, detail="", page=None, actions=0, decisions=0, elapsed_ms=0,
-                 errors=None, expectations=None, heal_events=None, agent=None):
+                 errors=None, expectations=None, heal_events=None, agent=None, refusals=None):
     """One JSON-serializable outcome row: the judgment, its evidence, and any expectation results.
 
     agent names the process that produced the row, so results from concurrent
     agents sharing one results file stay attributable."""
     record = {
-        "url": url,
+        "url": redact_url(url),
         "status": status,
         "detail": detail,
-        "final_url": (page or {}).get("url"),
+        "final_url": redact_url((page or {}).get("url")),
         "actions": actions,
         "decisions": decisions,
         "elapsed_ms": elapsed_ms,
@@ -133,6 +153,10 @@ def build_record(*, url, status, detail="", page=None, actions=0, decisions=0, e
         "expectations": expectations,
         "heal_events": heal_events or [],
     }
+    if refusals:
+        # Why the last decisions executed nothing; a stall with no reason on record
+        # can only be guessed at afterwards.
+        record["refusals"] = list(refusals)
     if agent is not None:
         record["agent"] = agent
     return record

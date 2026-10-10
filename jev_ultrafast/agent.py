@@ -6,7 +6,7 @@ import random
 import time
 from pathlib import Path
 
-from .browser import Browser, StalePage
+from .browser import Browser, CoveredTarget, StalePage
 from .model import action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
 
@@ -16,6 +16,12 @@ class BudgetExhausted(ValueError):
 
 class Stalled(ValueError):
     """Consecutive decisions executed no action; the run made no progress."""
+
+
+# A control an overlay covers cannot be clicked until the overlay clears, so
+# deciding again against the same page only spends billed calls. Fail early on
+# that specific refusal, with the covering element named in the stop reason.
+COVERED_STALL_LIMIT = 6
 
 
 # A freshly opened SPA tab can sit on a blank app shell (no text, no controls) while it
@@ -52,7 +58,7 @@ class Agent:
     def __init__(self, url, goals, *, record_dir=None, screenshots=False, foreground=False,
                  keep_open=False, collect_errors=True, heal_session=True, files=None,
                  max_actions=MAX_STEPS, max_decisions=MAX_STEPS * 2, max_stall=12, choose_retries=2,
-                 origin_wait=0):
+                 max_covered=COVERED_STALL_LIMIT, origin_wait=0):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
@@ -91,8 +97,11 @@ class Agent:
             max_actions=int(max_actions),
             max_decisions=int(max_decisions),
             max_stall=int(max_stall),
+            max_covered=int(max_covered),
             choose_retries=int(choose_retries),
             stalled_ticks=0,
+            covered_ticks=0,
+            refusals=[],
         )
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -129,17 +138,28 @@ class Agent:
                 result = self.command("act", {"fingerprint": state["page"]["fingerprint"]})
                 state["stalled_ticks"] = 0
                 return result
-            except StalePage:
+            except StalePage as refusal:
                 state["decision"] = None
                 state["status"] = "ready"
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 # Repeated decisions that execute nothing burn billed calls without progress.
+                # The last few reasons ride along so a stall on record says why it stalled.
+                reason = str(refusal)
                 state["stalled_ticks"] = state.get("stalled_ticks", 0) + 1
+                state["refusals"] = (state.get("refusals") or [])[-7:] + [reason]
+                state["covered_ticks"] = (
+                    state.get("covered_ticks", 0) + 1 if isinstance(refusal, CoveredTarget) else 0
+                )
+                if state["covered_ticks"] >= state.get("max_covered", COVERED_STALL_LIMIT):
+                    state["status"] = "blocked"
+                    raise Stalled(
+                        f"No reachable target after {state['covered_ticks']} decisions: {reason}"
+                    ) from None
                 if state["stalled_ticks"] >= state.get("max_stall", 12):
                     state["status"] = "blocked"
                     raise Stalled(
-                        f"No executed action for {state['stalled_ticks']} consecutive decisions."
+                        f"No executed action for {state['stalled_ticks']} consecutive decisions: {reason}"
                     ) from None
                 return self.snapshot()
         elif name == "predict":

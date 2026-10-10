@@ -67,6 +67,10 @@
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    // Same hit test the executor refuses on, taken here so an overlay is visible
+    // to the model instead of resurfacing as a rejected click it cannot explain.
+    const cover=document.elementFromPoint(x,y);
+    if (cover && !e.contains(cover)) base.covered=true;
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;

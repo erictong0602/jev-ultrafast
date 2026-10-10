@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from jev_ultrafast import agent as loop
-from jev_ultrafast import model
+from jev_ultrafast import model, questions
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
 
 
@@ -374,3 +374,89 @@ def test_a_page_that_stays_blank_still_gets_its_decision(monkeypatch):
     browser.observe.assert_not_called()  # Nothing changed; settling polls quietly and gives up.
     assert loop.choose.call_args[0][0] is blank
     assert agent.state["status"] == "predicted"
+
+
+def test_covered_target_is_refused_by_name_with_no_input(monkeypatch):
+    """An overlay is not staleness. The refusal names it, and it happens before any
+    input event, so the decision is safe to decide again."""
+    import jev_ultrafast.browser as browser
+
+    cdp = Mock(return_value={"result": {"value": {"blocked": browser.TARGET_REFUSALS["covered"]}}})
+    monkeypatch.setattr(browser, "cdp", cdp)
+    with pytest.raises(browser.CoveredTarget, match="covered by another element"):
+        browser_operation({"operation": "act", "session": "test",
+                           "action": {"id": "e1", "kind": "click", "node": 1}})
+    assert cdp.call_count == 1
+
+
+def test_a_changed_dropdown_option_stays_unconfirmed(monkeypatch):
+    """Coverage is refused softly; anything else about a select keeps the old
+    'inspect before retrying' contract, because a partial commit is possible there."""
+    import jev_ultrafast.browser as browser
+
+    cdp = Mock(return_value={"result": {"value": {"blocked": browser.TARGET_REFUSALS["option"]}}})
+    monkeypatch.setattr(browser, "cdp", cdp)
+    with pytest.raises(RuntimeError, match="Dropdown execution was not confirmed"):
+        browser_operation({"operation": "act", "session": "test",
+                           "action": {"id": "e1", "kind": "select", "node": 1, "value": "Design"}})
+
+
+def test_repeated_coverage_stops_before_the_generic_stall_limit(runner, monkeypatch):
+    """A covered control cannot be clicked until the overlay clears, so re-deciding
+    spends billed calls without progress: stop early and keep the reasons on record."""
+    import jev_ultrafast.browser as browser
+
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    runner.state["browser"].act.side_effect = browser.CoveredTarget(
+        f"Target {browser.TARGET_REFUSALS['covered']}; no input was sent."
+    )
+    assert loop.COVERED_STALL_LIMIT < 12  # Earlier than the generic limit, or it buys nothing.
+    with pytest.raises(loop.Stalled, match="No reachable target"):
+        for _ in range(loop.COVERED_STALL_LIMIT):
+            runner.command("tick")
+    assert runner.state["covered_ticks"] == loop.COVERED_STALL_LIMIT
+    assert len(runner.state["refusals"]) == loop.COVERED_STALL_LIMIT
+    assert "covered by another element" in runner.state["refusals"][-1]
+
+
+def test_a_navigation_refusal_still_runs_the_generic_stall_limit(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    runner.state["browser"].act.side_effect = StalePage("Target is gone. Observe again.")
+    for _ in range(loop.COVERED_STALL_LIMIT):
+        runner.command("tick")
+    assert runner.state["status"] == "ready"  # Not coverage: the page may still move.
+    assert runner.state["covered_ticks"] == 0
+    assert runner.state["stalled_ticks"] == loop.COVERED_STALL_LIMIT
+
+
+def test_the_stall_reason_names_why_the_last_decision_did_nothing(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    runner.state["max_stall"] = 2
+    runner.state["browser"].act.side_effect = StalePage("Target left the viewport. Observe again.")
+    with pytest.raises(loop.Stalled, match="left the viewport"):
+        for _ in range(2):
+            runner.command("tick")
+
+
+def test_covered_flag_reaches_the_model_element_table():
+    actions = [
+        {"id": "e1", "kind": "click", "label": "Analyze my resume", "role": "button", "value": "",
+         "node": 20, "covered": True},
+        {"id": "e2", "kind": "click", "label": "Accept", "role": "button", "value": "", "node": 21},
+    ]
+    elements, targets, controls = model.action_space(actions)
+    assert elements[0]["covered"] is True and "covered" not in elements[1]
+    assert targets["CLICK"]["1"]["covered"] is True and "covered" not in targets["CLICK"]["2"]
+
+
+def test_the_snapshot_flags_what_the_executor_refuses_as_covered():
+    """The JS has no DOM harness here, so pin the contract: the flag the model reads
+    comes from the same hit test the executor refuses on."""
+    import jev_ultrafast.browser as browser
+
+    assert "elementFromPoint" in browser.READ_STATE
+    assert "base.covered=true" in browser.READ_STATE
+
+
+def test_target_rules_explain_the_covered_flag():
+    assert "covered:true" in questions.TARGET

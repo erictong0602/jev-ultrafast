@@ -182,9 +182,42 @@ def test_agent_exposes_heal_session():
     assert "heal_session" in loop.Agent.__init__.__code__.co_varnames
 
 
-def fetch_enables(monkeypatch, url, **env):
-    """Construct a Browser with basic-auth env applied; return every Fetch.enable's params."""
+class FakePage:
+    """Enough of a document for Browser._load. A reload keeps its URL, so document
+    identity has to come from performance.timeOrigin and not from location.href."""
+
+    def __init__(self, href="https://protected.example.com/dashboard"):
+        self.href = href
+        self.time_origin = 1.0
+
+    def evaluate(self, expression):
+        if "performance.timeOrigin" in expression:
+            return self.time_origin
+        if "location.assign" in expression:
+            self.time_origin += 1  # A navigation: the next document is a new one.
+            return "navigating"
+        if "location.href" in expression:
+            return self.href
+        return "complete"
+
+    def reload(self, href=None):
+        """A reload: same URL, new document."""
+        self.href = href or self.href
+        self.time_origin += 1
+
+
+def browser_with_auth(monkeypatch, url, page=None, **env):
+    """Construct a Browser with basic-auth env applied; return every protocol call made.
+
+    The fake daemon behaves like Chrome 154: once the navigation is kicked off,
+    the drain yields the auth challenge and then the renderer-swap event burst
+    (detach after the pause, re-attach right after)."""
+    page = page or FakePage()
     methods = []
+    scope = {s.strip() for s in env.get("JEV_BASIC_AUTH_ORIGIN", "").split(",") if s.strip()}
+    netloc = url.split("://", 1)[1].split("/", 1)[0] if "://" in url else url
+    auth_applies = not scope or netloc in scope
+    state = {"nav": False, "served": False}
 
     def cdp(method, **params):
         methods.append((method, params))
@@ -193,27 +226,51 @@ def fetch_enables(monkeypatch, url, **env):
         if method == "Target.attachToTarget":
             return {"sessionId": "s1"}
         if method == "Runtime.evaluate":
-            return {"result": {"value": "complete"}}
+            if "location.assign" in params.get("expression", ""):
+                state["nav"] = True
+            return {"result": {"value": page.evaluate(params.get("expression", ""))}}
         return {}
+
+    def fake_drain():
+        if not state["served"] and state["nav"] and auth_applies:
+            state["served"] = True
+            return [
+                {"session_id": "s1", "method": "Fetch.authRequired",
+                 "params": {"request": {"url": url}, "requestId": "r1"}},
+                {"session_id": "s1", "method": "Inspector.detached",
+                 "params": {"reason": "Render process gone"}},
+                {"method": "Target.detachedFromTarget", "params": {"sessionId": "s1"}},
+                {"method": "Target.attachedToTarget",
+                 "params": {"sessionId": "s2", "targetInfo": {"targetId": "t1", "type": "page"}}},
+            ]
+        return []
 
     monkeypatch.setattr(browser_mod, "ensure_daemon", lambda: None)
     monkeypatch.setattr(browser_mod, "cdp", cdp)
-    monkeypatch.setattr(browser_mod, "drain_events", lambda: [])
+    monkeypatch.setattr(browser_mod, "drain_events", fake_drain)
     monkeypatch.setenv("JEV_BASIC_AUTH_USERNAME", "user")
     monkeypatch.setenv("JEV_BASIC_AUTH_PASSWORD", "pass")
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     Browser(url, collect_errors=False, heal_session=False).close()
-    # Session routing is not part of the interception contract; compare the policy only.
+    return methods
+
+
+def fetch_enables(methods):
+    """The interception policy only; session routing is not part of the contract."""
     return [
         {key: value for key, value in params.items() if key != "session_id"}
         for method, params in methods if method == "Fetch.enable"
     ]
 
 
+def evaluate_expressions(methods):
+    return [params.get("expression", "") for method, params in methods if method == "Runtime.evaluate"]
+
+
 def test_basic_auth_intercepts_documents_only_at_request_stage(monkeypatch):
-    enables = fetch_enables(monkeypatch, "https://protected.example.com/dashboard")
-    assert enables == [
+    methods = browser_with_auth(monkeypatch, "https://protected.example.com/dashboard")
+    assert fetch_enables(methods) == [
         {
             "handleAuthRequests": True,
             "patterns": [
@@ -228,15 +285,99 @@ def test_basic_auth_intercepts_documents_only_at_request_stage(monkeypatch):
 
 
 def test_basic_auth_origin_scopes_interception_to_named_hosts(monkeypatch):
-    assert fetch_enables(
+    assert fetch_enables(browser_with_auth(
         monkeypatch, "https://secrets.example.dev/", JEV_BASIC_AUTH_ORIGIN="protected.example.com"
-    ) == []  # Landing origin is not the protected one: no interception at all.
-    enables = fetch_enables(
+    )) == []  # Landing origin is not the protected one: no interception at all.
+    enables = fetch_enables(browser_with_auth(
         monkeypatch,
         "https://protected.example.com/",
         JEV_BASIC_AUTH_ORIGIN="protected.example.com,other.example.com",
-    )
+    ))
     assert enables and enables[0]["patterns"][0]["urlPattern"] == "https://protected.example.com/*"
+
+
+def test_basic_auth_navigation_never_blocks_on_page_navigate(monkeypatch):
+    """The challenge that answers an intercepted navigation arrives as an event, so a
+    command that waits for the navigation to resolve can never be answered: the document
+    stays put and every later call queues behind it until the daemon gives up."""
+    methods = browser_with_auth(monkeypatch, "https://protected.example.com/dashboard")
+    assert "Page.navigate" not in [method for method, _ in methods]
+    assert any("location.assign" in expression for expression in evaluate_expressions(methods))
+
+
+def test_plain_navigation_still_uses_page_navigate(monkeypatch):
+    methods = browser_with_auth(monkeypatch, "https://example.test/", JEV_BASIC_AUTH_ORIGIN="other.example.com")
+    assert "Page.navigate" in [method for method, _ in methods]
+
+
+def test_a_reload_of_the_same_url_still_counts_as_a_new_document(monkeypatch):
+    page = FakePage()
+    b = Browser.__new__(Browser)
+    monkeypatch.setattr(Browser, "evaluate", lambda self, expression: page.evaluate(expression))
+    before = page.evaluate("performance.timeOrigin")
+    assert b._document_replaced(before) is False  # Nothing moved yet.
+    page.reload()  # Same URL, new document: a URL comparison would have waited out the deadline.
+    assert b._document_replaced(before) is True
+    page.href = "about:blank"
+    assert b._document_replaced(None) is False  # No marker: about:blank proves nothing.
+    page.href = "https://protected.example.com/dashboard"
+    assert b._document_replaced(None) is True
+
+
+def drain_browser():
+    b = Browser.__new__(Browser)
+    b.session = "ours"
+    b.auth_origin = "protected.example.com"
+    b.auth_username = "user"
+    b.auth_password = "pass"
+    b.auth_challenges = 0
+    b.collect_errors = True
+    b.errors = []
+    b.error_counts = {}
+    b._request_urls = {}
+    b.document_status = None
+    b.document_url = ""
+    return b
+
+
+def test_drain_answers_the_challenge_and_flags_fetch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browser_mod, "drain_events", lambda: [
+        {"session_id": "ours", "method": "Fetch.authRequired",
+         "params": {"request": {"url": "https://protected.example.com/a"}, "requestId": "r1"}},
+    ])
+    monkeypatch.setattr(browser_mod, "cdp", lambda method, **params: calls.append((method, params)) or {})
+    b = drain_browser()
+    assert b._drain() == {"fetch": True}
+    assert calls[0][0] == "Fetch.continueWithAuth"
+    assert calls[0][1]["authChallengeResponse"]["username"] == "user"
+
+
+def test_drain_other_origins_challenges_are_cancelled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browser_mod, "drain_events", lambda: [
+        {"session_id": "ours", "method": "Fetch.authRequired",
+         "params": {"request": {"url": "https://elsewhere.example/x"}, "requestId": "r2"}},
+    ])
+    monkeypatch.setattr(browser_mod, "cdp", lambda method, **params: calls.append((method, params)) or {})
+    b = drain_browser()
+    assert b._drain() == {"fetch": True}
+    assert calls[0][1]["authChallengeResponse"]["response"] == "CancelAuth"
+
+
+def test_drain_flags_the_renderer_swap_from_browser_level_events(monkeypatch):
+    """The swap events are browser-level (no session id on the envelope), so the
+    drain matches them by their params instead of dropping them with the rest."""
+    monkeypatch.setattr(browser_mod, "drain_events", lambda: [
+        {"method": "Target.detachedFromTarget", "params": {"sessionId": "ours"}},
+        {"method": "Target.attachedToTarget",
+         "params": {"sessionId": "new", "targetInfo": {"targetId": "t1"}}},
+        {"method": "Target.attachedToTarget",
+         "params": {"sessionId": "x", "targetInfo": {"targetId": "someone-else"}}},
+    ])
+    b = drain_browser()
+    b.target = "t1"
+    assert b._drain() == {"detached": True, "reattached": True}
 
 
 def test_no_credentials_means_no_interception(monkeypatch):
